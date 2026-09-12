@@ -1,0 +1,24 @@
+# Virtual environments — keep machine-local, never push
+hawkEnv/
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+dist/
+build/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
