@@ -9,6 +9,7 @@ from pathlib import Path
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     OpaqueFunction,
     SetEnvironmentVariable,
     SetLaunchConfiguration,
@@ -108,17 +109,24 @@ def _launch_setup(context, *args, **kwargs):
     print("[gcr16 v1] resolved mesh", resolved, "exists", resolved.is_file())
     if stl0.is_file():
         print(f"[gcr16 v1] {stl0} size={stl0.stat().st_size} bytes")
-    if mode == "move":
-        for index in range(7):
-            stl = Path(mesh_dir) / f"GCR16-J{index}.stl"
-            if not stl.is_file():
-                print(f"[gcr16 v1] WARNING missing {stl.name} — run scripts/export_meshes.sh")
-                continue
-            if stl.stat().st_size < 400000 and index in (1, 2):
-                print(
-                    f"[gcr16 v1] WARNING {stl.name} is tiny ({stl.stat().st_size} bytes). "
-                    "Re-export from isaac_sim_test/3d/GCR16-Jn.step via scripts/export_meshes.sh"
-                )
+    for index in range(7):
+        stl = Path(mesh_dir) / f"GCR16-J{index}.stl"
+        if not stl.is_file():
+            print(f"[gcr16 v1] WARNING missing {stl.name} — run scripts/export_meshes.sh")
+            continue
+        print(f"[gcr16 v1] mesh {stl.name} bytes={stl.stat().st_size}")
+        if stl.stat().st_size < 400000 and index in (1, 2):
+            print(
+                f"[gcr16 v1] WARNING {stl.name} is tiny. "
+                "Need per-link Fusion export via scripts/run_display_move.sh"
+            )
+    sys.path.insert(0, str(v1 / "scripts"))
+    try:
+        from gcr16_pivots import format_pivot_table
+
+        print(format_pivot_table())
+    except Exception as exc:
+        print("[gcr16 v1] pivot table skip", exc)
     if use_cad.lower() in ("true", "1") and (not stl0.is_file() or stl0.stat().st_size < 80):
         print(
             f"[gcr16 v1] Missing or empty {stl0} — using dummy boxes. "
@@ -175,6 +183,14 @@ def _launch_setup(context, *args, **kwargs):
             )
         )
         print("[gcr16 v1] starting joint_state_publisher_gui on /gcr16/joint_states")
+    nodes.append(
+        ExecuteProcess(
+            cmd=[sys.executable, str(v1 / "scripts" / "publish_pivot_markers.py")],
+            output="screen",
+            additional_env={"AMENT_PREFIX_PATH": ament},
+        )
+    )
+    print("[gcr16 v1] pivot markers on /gcr16/pivot_markers (colored arrows = measured pins)")
     nodes.append(
         Node(
             package="rviz2",
