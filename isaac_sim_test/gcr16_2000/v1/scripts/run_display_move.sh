@@ -18,6 +18,19 @@ _link_step() {
 }
 
 need_export=0
+stamp="${MESH_DIR}/.link_local_v2"
+j1="${MESH_DIR}/GCR16-J1.stl"
+if [ "${FORCE_MESH:-0}" = "1" ]; then
+  need_export=1
+fi
+if [ ! -f "${stamp}" ]; then
+  echo "Mesh stamp missing (${stamp}) — will rebuild link-local STLs"
+  need_export=1
+fi
+if [ -f "${j1}" ] && [ "$(wc -c < "${j1}")" -lt 1000000 ]; then
+  echo "GCR16-J1.stl is tiny — looks like the old 7-solid split, rebuilding"
+  need_export=1
+fi
 for i in 0 1 2 3 4 5 6; do
   step="$(_link_step "${i}")"
   stl="${MESH_DIR}/GCR16-J${i}.stl"
@@ -32,7 +45,7 @@ for i in 0 1 2 3 4 5 6; do
 done
 
 if [ "${need_export}" -eq 1 ]; then
-  echo "Link STEPs newer than STLs — exporting per-link Fusion STEPs (not the full assembly)"
+  echo "Exporting per-link Fusion STEPs to link-local ROS STLs"
   FC=""
   for c in freecadcmd FreeCADCmd freecad.cmd; do
     if command -v "${c}" >/dev/null 2>&1; then
@@ -51,6 +64,7 @@ if [ "${need_export}" -eq 1 ]; then
   echo "FC       ${FC}"
   "${FC}" "${V1}/scripts/export_link_steps_freecad.py"
   python3 "${V1}/scripts/fix_stls.py" "${MESH_DIR}"
+  date > "${stamp}"
   echo "--- meshes ---"
   ls -lh "${MESH_DIR}"/GCR16-J*.stl
 fi
