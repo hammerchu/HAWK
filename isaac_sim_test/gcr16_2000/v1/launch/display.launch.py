@@ -97,7 +97,7 @@ def _launch_setup(context, *args, **kwargs):
     )
     if not mesh_dir:
         mesh_dir = str(v1 / "meshes")
-    print(f"[gcr16 v1] mode={mode} slider={'yes' if mode == 'move' else 'no'}"))
+    print(f"[gcr16 v1] mode={mode} slider={'yes' if mode == 'move' else 'no'}")
 
     if use_cad.lower() in ("true", "1"):
         _fix_stls(mesh_dir)
