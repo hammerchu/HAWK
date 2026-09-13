@@ -1,49 +1,51 @@
 #!/usr/bin/env python3
-"""Export GCR16-J0..J6 solids from the STEP assembly to STL (run via FreeCAD cmd).
+"""Export GCR16 meshes from STEP using FreeCAD Part.read (no CLI extra files).
 
-Meshes stay in the STEP assembly frame so the assembled URDF can stack them at origin.
+FreeCADCmd treats extra arguments as documents to open, which crashed 0.19 on
+this SolidWorks STEP. Paths come from GCR16_STEP and GCR16_OUT.
 """
 
 import os
 import sys
 
 
-def _export_label_to_stl(doc, out_dir, label_prefix, out_name):
-    """Find a document object whose label starts with label_prefix and write STL."""
-    matches = []
-    for obj in doc.Objects:
-        label = getattr(obj, "Label", "") or ""
-        name = getattr(obj, "Name", "") or ""
-        if label.startswith(label_prefix) or name.startswith(label_prefix):
-            if hasattr(obj, "Shape") and not obj.Shape.isNull():
-                matches.append(obj)
-    if not matches:
-        print("WARNING: no shape for", label_prefix)
-        return False
-    # Prefer the largest solid if the part imported as several bits.
-    obj = max(matches, key=lambda o: o.Shape.Volume if hasattr(o.Shape, "Volume") else 0)
-    out_path = os.path.join(out_dir, out_name)
-    obj.Shape.exportStl(out_path)
-    print("Wrote", out_path, "from", obj.Label, "volume", getattr(obj.Shape, "Volume", "?"))
-    return True
-
-
-def main():
-    """Import STEP in FreeCAD and write one STL per GCR16-Jn part."""
-    if len(sys.argv) < 3:
-        print("Usage: freecadcmd export_meshes_freecad.py STEP_PATH OUT_DIR")
+def _env_paths():
+    """Read STEP and output dir from the environment."""
+    step_path = os.environ.get("GCR16_STEP", "")
+    out_dir = os.environ.get("GCR16_OUT", "")
+    if not step_path or not out_dir:
+        print("Set GCR16_STEP and GCR16_OUT. Do not pass them as FreeCADCmd args.")
         sys.exit(1)
-
-    step_path = sys.argv[1]
-    out_dir = sys.argv[2]
+    if not os.path.isfile(step_path):
+        print("STEP not found:", step_path)
+        sys.exit(1)
     os.makedirs(out_dir, exist_ok=True)
+    return step_path, out_dir
 
-    import FreeCAD  # noqa: F401
-    import Import
 
-    doc = FreeCAD.newDocument("gcr16_export")
-    Import.insert(step_path, doc.Name)
-    FreeCAD.setActiveDocument(doc.Name)
+def _write_stl(shape, out_path, deflection=0.4):
+    """Tessellate a shape and write STL. deflection is in STEP units (mm)."""
+    try:
+        shape.exportStl(out_path, deflection)
+    except TypeError:
+        shape.exportStl(out_path)
+    print("Wrote", out_path, "volume", getattr(shape, "Volume", "?"))
+
+
+def _solids_from_part_read(step_path):
+    """Load STEP through OCCT Part.read — more stable than ImportOCAF on 0.19."""
+    import Part
+
+    shape = Part.Shape()
+    shape.read(step_path)
+    solids = list(shape.Solids)
+    print("Part.read solids:", len(solids), "volume", shape.Volume)
+    return shape, solids
+
+
+def _export_named_from_doc(doc, out_dir):
+    """If OCAF import survived, export objects named GCR16-Jn."""
+    import FreeCAD
 
     expected = [
         ("GCR16-J0", "GCR16-J0.stl"),
@@ -56,13 +58,74 @@ def main():
     ]
     ok = 0
     for prefix, stl_name in expected:
-        if _export_label_to_stl(doc, out_dir, prefix, stl_name):
-            ok += 1
-    print("Exported", ok, "of", len(expected), "meshes to", out_dir)
-    if ok == 0:
-        print("Objects in document:")
+        matches = []
         for obj in doc.Objects:
-            print(" ", obj.Name, obj.Label, type(obj).__name__)
+            label = getattr(obj, "Label", "") or ""
+            name = getattr(obj, "Name", "") or ""
+            if (label.startswith(prefix) or name.startswith(prefix)) and hasattr(obj, "Shape"):
+                if not obj.Shape.isNull():
+                    matches.append(obj)
+        if not matches:
+            print("WARNING: no shape for", prefix)
+            continue
+        obj = max(matches, key=lambda o: o.Shape.Volume if hasattr(o.Shape, "Volume") else 0)
+        _write_stl(obj.Shape, os.path.join(out_dir, stl_name))
+        ok += 1
+    return ok
+
+
+def _export_solids_sorted(solids, out_dir):
+    """Name the 7 biggest solids J0..J6 by rising bbox Z (base first)."""
+    usable = [s for s in solids if s.Volume > 1.0]
+    usable.sort(key=lambda s: s.Volume, reverse=True)
+    usable = usable[:7]
+    usable.sort(key=lambda s: s.BoundBox.ZMin)
+    names = [
+        "GCR16-J0.stl",
+        "GCR16-J1.stl",
+        "GCR16-J2.stl",
+        "GCR16-J3.stl",
+        "GCR16-J4.stl",
+        "GCR16-J5.stl",
+        "GCR16-J6.stl",
+    ]
+    if len(usable) < 7:
+        print("Only", len(usable), "solids — writing what we have.")
+    for shape, name in zip(usable, names):
+        bb = shape.BoundBox
+        print(
+            name,
+            "ZMin",
+            round(bb.ZMin, 2),
+            "ZMax",
+            round(bb.ZMax, 2),
+            "V",
+            round(shape.Volume, 1),
+        )
+        _write_stl(shape, os.path.join(out_dir, name))
+    return len(usable)
+
+
+def main():
+    """Export per-link STLs, then a combined STL, without feeding paths to FreeCADCmd."""
+    step_path, out_dir = _env_paths()
+    print("STEP", step_path)
+    print("OUT ", out_dir)
+
+    import FreeCAD
+    import Part
+
+    whole, solids = _solids_from_part_read(step_path)
+    _write_stl(whole, os.path.join(out_dir, "GCR16-all.stl"))
+
+    ok = 0
+    if solids:
+        ok = _export_solids_sorted(solids, out_dir)
+    else:
+        print("No solids from Part.read; not using Import.insert (segfaults on 0.19).")
+
+    print("Per-link meshes:", ok)
+    if ok == 0 and not os.path.isfile(os.path.join(out_dir, "GCR16-all.stl")):
         sys.exit(2)
 
 

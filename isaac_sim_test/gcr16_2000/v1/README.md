@@ -29,9 +29,11 @@ sudo apt install -y \
   ros-humble-xacro \
   ros-humble-rviz2
 
-# 3) Export STLs next to this package (needs the STEP under isaac_sim_test/3d/)
+# 3) Export STLs next to this package (needs isaac_sim_test/3d/GCR16-2000.STEP)
 cd /path/to/HAWK/isaac_sim_test/gcr16_2000/v1
 ./scripts/export_meshes.sh
+# FreeCAD 0.19 ImportOCAF crashed on this STEP; the script now uses Part.read
+# and only passes the .py to freecadcmd (STEP path is GCR16_STEP in the env).
 
 # 4) See the CAD pose (no joint motion)
 source /opt/ros/humble/setup.bash
