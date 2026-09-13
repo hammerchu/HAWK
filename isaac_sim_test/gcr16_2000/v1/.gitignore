@@ -1,0 +1,5 @@
+.ament_prefix/
+meshes/*.stl
+meshes/*.STL
+meshes/*.dae
+meshes/*.obj

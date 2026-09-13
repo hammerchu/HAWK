@@ -18,7 +18,7 @@
       <xacro:if value="${use_cad_meshes}">
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="file://${mesh_dir}/${stl_name}" scale="0.001 0.001 0.001"/>
+          <mesh filename="package://gcr16_2000_v1/meshes/${stl_name}" scale="0.001 0.001 0.001"/>
         </geometry>
       </xacro:if>
       <xacro:unless value="${use_cad_meshes}">
@@ -35,7 +35,7 @@
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <xacro:if value="${use_cad_meshes}">
         <geometry>
-          <mesh filename="file://${mesh_dir}/${stl_name}" scale="0.001 0.001 0.001"/>
+          <mesh filename="package://gcr16_2000_v1/meshes/${stl_name}" scale="0.001 0.001 0.001"/>
         </geometry>
       </xacro:if>
       <xacro:unless value="${use_cad_meshes}">
