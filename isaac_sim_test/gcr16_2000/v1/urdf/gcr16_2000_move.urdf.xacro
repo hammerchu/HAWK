@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <robot name="gcr16_2000" xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <!-- Pins from Fusion indicators via scripts/read_joint_indicators.py --ros-z-up.
+  <!-- Pins from Fusion indicators via scripts/read_joint_indicators.py (ros z-up).
        World pins (m): J1 0,0,0.1176  J2 0.1239,0,0.2350  J3 0.133301,0,1.2125
                        J4 0.103301,0,2.1090  J5 0.160801,0,2.1775  J6 0.229301,0,2.2350
        Joint xyz is parent-relative (world-aligned frames, rpy 0).
