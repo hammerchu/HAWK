@@ -7,7 +7,12 @@ import sys
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
+from launch.actions import (
+    DeclareLaunchArgument,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    SetLaunchConfiguration,
+)
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -36,6 +41,26 @@ def _register_ament_prefix(v1):
     return prefix
 
 
+def _parse_cli_launch_args(argv):
+    """Parse ros2-style name:=value tokens from argv."""
+    parsed = []
+    for argument in argv:
+        if ":=" not in argument or argument.startswith(":="):
+            continue
+        name, value = argument.split(":=", maxsplit=1)
+        parsed.append((name, value))
+    return parsed
+
+
+def _cli_launch_arg(name, default):
+    """Read name:=value from process argv (python3 launch or ros2 launch)."""
+    prefix = f"{name}:="
+    for arg in sys.argv:
+        if arg.startswith(prefix):
+            return arg.split(":=", 1)[1]
+    return default
+
+
 def _fix_stls(mesh_dir):
     """Rewrite STLs as binary if the helper script is present."""
     fixer = _v1_dir() / "scripts" / "fix_stls.py"
@@ -43,12 +68,15 @@ def _fix_stls(mesh_dir):
         return
     import runpy
 
+    saved_argv = sys.argv
     sys.argv = [str(fixer), str(mesh_dir)]
     try:
         runpy.run_path(str(fixer), run_name="__main__")
     except SystemExit as exc:
         if exc.code not in (0, None):
             print("[gcr16 v1] fix_stls exit", exc.code)
+    finally:
+        sys.argv = saved_argv
 
 
 def _launch_setup(context, *args, **kwargs):
@@ -58,11 +86,18 @@ def _launch_setup(context, *args, **kwargs):
     ament = str(prefix) + os.pathsep + os.environ.get("AMENT_PREFIX_PATH", "")
     os.environ["AMENT_PREFIX_PATH"] = ament
 
-    mode = LaunchConfiguration("mode").perform(context)
-    use_cad = LaunchConfiguration("use_cad_meshes").perform(context)
-    mesh_dir = LaunchConfiguration("mesh_dir").perform(context)
+    # python3 launch/display.launch.py mode:=move does not go through ros2 launch,
+    # so DeclareLaunchArgument stays at default unless we also read sys.argv.
+    mode = _cli_launch_arg("mode", LaunchConfiguration("mode").perform(context))
+    use_cad = _cli_launch_arg(
+        "use_cad_meshes", LaunchConfiguration("use_cad_meshes").perform(context)
+    )
+    mesh_dir = _cli_launch_arg(
+        "mesh_dir", LaunchConfiguration("mesh_dir").perform(context)
+    )
     if not mesh_dir:
         mesh_dir = str(v1 / "meshes")
+    print(f"[gcr16 v1] mode={mode} slider={'yes' if mode == 'move' else 'no'}"))
 
     if use_cad.lower() in ("true", "1"):
         _fix_stls(mesh_dir)
@@ -123,9 +158,12 @@ def _launch_setup(context, *args, **kwargs):
             Node(
                 package="joint_state_publisher_gui",
                 executable="joint_state_publisher_gui",
-                remappings=js_remap,
+                parameters=[{"robot_description": robot_desc}],
+                remappings=js_remap
+                + [("robot_description", "/gcr16/robot_description")],
             )
         )
+        print("[gcr16 v1] starting joint_state_publisher_gui on /gcr16/joint_states")
     nodes.append(
         Node(
             package="rviz2",
@@ -155,11 +193,18 @@ def generate_launch_description():
 
 
 def main(argv=None):
-    """Allow `python3 launch/display.launch.py` on the sim box without colcon."""
+    """Allow `python3 launch/display.launch.py mode:=move` without colcon."""
     from launch import LaunchService
 
+    if argv is None:
+        argv = sys.argv[1:]
+    extra = [
+        SetLaunchConfiguration(name, value)
+        for name, value in _parse_cli_launch_args(argv)
+    ]
     ls = LaunchService(argv=argv)
-    ls.include_launch_description(generate_launch_description())
+    ld = generate_launch_description()
+    ls.include_launch_description(LaunchDescription(extra + list(ld.entities)))
     return ls.run()
 
 
