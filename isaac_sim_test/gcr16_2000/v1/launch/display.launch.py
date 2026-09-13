@@ -87,9 +87,22 @@ def _launch_setup(context, *args, **kwargs):
 
     import xacro
 
+    use_combined = "true"
+    all_stl = Path(mesh_dir) / "GCR16-all.stl"
+    if mode == "assembled" and use_cad.lower() in ("true", "1"):
+        if all_stl.is_file() and all_stl.stat().st_size > 80:
+            print(f"[gcr16 v1] using combined mesh {all_stl} size={all_stl.stat().st_size}")
+        else:
+            use_combined = "false"
+            print("[gcr16 v1] no GCR16-all.stl — per-link meshes")
+
+    mappings = {"use_cad_meshes": use_cad, "mesh_dir": mesh_dir}
+    if mode == "assembled":
+        mappings["use_combined_mesh"] = use_combined
+
     robot_desc = xacro.process_file(
         str(xacro_path),
-        mappings={"use_cad_meshes": use_cad, "mesh_dir": mesh_dir},
+        mappings=mappings,
     ).toxml()
 
     rviz_cfg = v1 / "rviz" / "display.rviz"

@@ -2,10 +2,12 @@
 <robot name="gcr16_2000" xmlns:xacro="http://www.ros.org/wiki/xacro">
   <!-- CAD-pose check: every STL stays in STEP world frame; joints are fixed at origin. -->
   <xacro:arg name="use_cad_meshes" default="true"/>
+  <xacro:arg name="use_combined_mesh" default="true"/>
   <xacro:arg name="mesh_dir" default=""/>
   <xacro:include filename="gcr16_common.xacro"/>
 
   <xacro:property name="use_cad" value="$(arg use_cad_meshes)"/>
+  <xacro:property name="use_combined" value="$(arg use_combined_mesh)"/>
   <xacro:property name="mesh_dir" value="$(arg mesh_dir)"/>
 
   <link name="world"/>
@@ -16,10 +18,18 @@
   </joint>
 
   <link name="base_link">
-    <xacro:gcr16_cad_or_dummy
-      link_name="base_link" stl_name="GCR16-J0.stl"
-      dummy_xyz="0 0 0.08" dummy_size="0.22 0.22 0.16"
-      use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+    <xacro:if value="${use_combined}">
+      <xacro:gcr16_cad_or_dummy
+        link_name="base_link" stl_name="GCR16-all.stl"
+        dummy_xyz="0 0 0.08" dummy_size="0.22 0.22 0.16"
+        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+    </xacro:if>
+    <xacro:unless value="${use_combined}">
+      <xacro:gcr16_cad_or_dummy
+        link_name="base_link" stl_name="GCR16-J0.stl"
+        dummy_xyz="0 0 0.08" dummy_size="0.22 0.22 0.16"
+        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+    </xacro:unless>
   </link>
 
   <xacro:macro name="fixed_cad_link" params="parent child stl dummy_xyz dummy_size">
@@ -29,10 +39,12 @@
       <origin xyz="0 0 0" rpy="0 0 0"/>
     </joint>
     <link name="${child}">
-      <xacro:gcr16_cad_or_dummy
-        link_name="${child}" stl_name="${stl}"
-        dummy_xyz="${dummy_xyz}" dummy_size="${dummy_size}"
-        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+      <xacro:unless value="${use_combined}">
+        <xacro:gcr16_cad_or_dummy
+          link_name="${child}" stl_name="${stl}"
+          dummy_xyz="${dummy_xyz}" dummy_size="${dummy_size}"
+          use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+      </xacro:unless>
     </link>
   </xacro:macro>
 
