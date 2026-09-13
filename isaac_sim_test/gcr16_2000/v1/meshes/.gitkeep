@@ -1,0 +1,3 @@
+# STLs are generated on the sim box (STEP is 21MB).
+# Expected names after ./scripts/export_meshes.sh:
+#   GCR16-J0.stl ... GCR16-J6.stl

@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Shared macros for GCR16-2000 v1. Meshes are assembly-world STLs from the STEP. -->
+
+  <xacro:property name="deg360" value="6.28318530718"/>
+  <xacro:property name="mesh_pkg" value="gcr16_2000_v1"/>
+
+  <xacro:macro name="gcr16_inertial_box" params="mass x y z">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="gcr16_cad_or_dummy" params="link_name stl_name dummy_xyz dummy_size use_cad_meshes mesh_dir">
+    <visual>
+      <xacro:if value="${use_cad_meshes}">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="file://${mesh_dir}/${stl_name}" scale="0.001 0.001 0.001"/>
+        </geometry>
+      </xacro:if>
+      <xacro:unless value="${use_cad_meshes}">
+        <origin xyz="${dummy_xyz}" rpy="0 0 0"/>
+        <geometry>
+          <box size="${dummy_size}"/>
+        </geometry>
+      </xacro:unless>
+      <material name="gcr_gray">
+        <color rgba="0.55 0.58 0.62 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <xacro:if value="${use_cad_meshes}">
+        <geometry>
+          <mesh filename="file://${mesh_dir}/${stl_name}" scale="0.001 0.001 0.001"/>
+        </geometry>
+      </xacro:if>
+      <xacro:unless value="${use_cad_meshes}">
+        <geometry>
+          <box size="${dummy_size}"/>
+        </geometry>
+      </xacro:unless>
+    </collision>
+    <xacro:gcr16_inertial_box mass="8.0" x="0.1" y="0.1" z="0.1"/>
+  </xacro:macro>
+</robot>

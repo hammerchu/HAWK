@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<robot name="gcr16_2000" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- PLACEHOLDER kinematics. Axes/xyz are cobot-typical guesses for 2m reach.
+       Tune against CAD before using this to replace the Panda. -->
+  <xacro:arg name="use_cad_meshes" default="false"/>
+  <xacro:arg name="mesh_dir" default=""/>
+  <xacro:include filename="gcr16_common.xacro"/>
+
+  <xacro:property name="use_cad" value="$(arg use_cad_meshes)"/>
+  <xacro:property name="mesh_dir" value="$(arg mesh_dir)"/>
+
+  <link name="world"/>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link">
+    <xacro:gcr16_cad_or_dummy
+      link_name="base_link" stl_name="GCR16-J0.stl"
+      dummy_xyz="0 0 0.08" dummy_size="0.22 0.22 0.16"
+      use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+  </link>
+
+  <xacro:macro name="gcr16_revolute" params="name parent child xyz rpy axis vel stl dummy_xyz dummy_size">
+    <joint name="${name}" type="revolute">
+      <parent link="${parent}"/>
+      <child link="${child}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+      <axis xyz="${axis}"/>
+      <limit lower="${-deg360}" upper="${deg360}" effort="150" velocity="${vel}"/>
+    </joint>
+    <link name="${child}">
+      <xacro:gcr16_cad_or_dummy
+        link_name="${child}" stl_name="${stl}"
+        dummy_xyz="${dummy_xyz}" dummy_size="${dummy_size}"
+        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+    </link>
+  </xacro:macro>
+
+  <!-- Joint speeds from the spec: 120, 180, 225 deg/s -> rad/s -->
+  <xacro:gcr16_revolute name="gcr16_joint1" parent="base_link" child="gcr16_link1"
+    xyz="0 0 0.163" rpy="0 0 0" axis="0 0 1" vel="2.094"
+    stl="GCR16-J1.stl" dummy_xyz="0 0 0.08" dummy_size="0.14 0.14 0.16"/>
+  <xacro:gcr16_revolute name="gcr16_joint2" parent="gcr16_link1" child="gcr16_link2"
+    xyz="0 0 0.000" rpy="0 0 0" axis="0 1 0" vel="3.142"
+    stl="GCR16-J2.stl" dummy_xyz="0 0 0.35" dummy_size="0.12 0.12 0.70"/>
+  <xacro:gcr16_revolute name="gcr16_joint3" parent="gcr16_link2" child="gcr16_link3"
+    xyz="0 0 0.700" rpy="0 0 0" axis="0 1 0" vel="3.927"
+    stl="GCR16-J3.stl" dummy_xyz="0 0 0.25" dummy_size="0.11 0.11 0.50"/>
+  <xacro:gcr16_revolute name="gcr16_joint4" parent="gcr16_link3" child="gcr16_link4"
+    xyz="0 0 0.500" rpy="0 0 0" axis="0 1 0" vel="3.927"
+    stl="GCR16-J4.stl" dummy_xyz="0 0 0.10" dummy_size="0.10 0.10 0.20"/>
+  <xacro:gcr16_revolute name="gcr16_joint5" parent="gcr16_link4" child="gcr16_link5"
+    xyz="0 0 0.200" rpy="0 0 0" axis="0 1 0" vel="3.927"
+    stl="GCR16-J5.stl" dummy_xyz="0 0 0.09" dummy_size="0.09 0.09 0.18"/>
+  <xacro:gcr16_revolute name="gcr16_joint6" parent="gcr16_link5" child="gcr16_link6"
+    xyz="0 0 0.180" rpy="0 0 0" axis="0 0 1" vel="3.927"
+    stl="GCR16-J6.stl" dummy_xyz="0 0 0.04" dummy_size="0.08 0.08 0.08"/>
+</robot>

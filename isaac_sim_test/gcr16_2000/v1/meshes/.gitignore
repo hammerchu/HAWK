@@ -1,0 +1,5 @@
+*.stl
+*.STL
+*.dae
+*.obj
+!.gitkeep
