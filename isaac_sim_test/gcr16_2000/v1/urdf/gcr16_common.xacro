@@ -13,10 +13,11 @@
     </inertial>
   </xacro:macro>
 
-  <xacro:macro name="gcr16_cad_or_dummy" params="link_name stl_name dummy_xyz dummy_size use_cad_meshes mesh_dir">
+  <xacro:macro name="gcr16_cad_or_dummy" params="link_name stl_name dummy_xyz dummy_size use_cad_meshes mesh_dir mesh_xyz:='0 0 0'">
+    <!-- mesh_xyz cancels the link frame so assembly-world STLs stay in CAD pose at q=0. -->
     <visual>
       <xacro:if value="${use_cad_meshes}">
-        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <origin xyz="${mesh_xyz}" rpy="0 0 0"/>
         <geometry>
           <mesh filename="package://gcr16_2000_v1/meshes/${stl_name}" scale="0.001 0.001 0.001"/>
         </geometry>
@@ -32,13 +33,14 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
       <xacro:if value="${use_cad_meshes}">
+        <origin xyz="${mesh_xyz}" rpy="0 0 0"/>
         <geometry>
           <mesh filename="package://gcr16_2000_v1/meshes/${stl_name}" scale="0.001 0.001 0.001"/>
         </geometry>
       </xacro:if>
       <xacro:unless value="${use_cad_meshes}">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
           <box size="${dummy_size}"/>
         </geometry>

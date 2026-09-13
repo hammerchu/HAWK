@@ -1,8 +1,11 @@
 <?xml version="1.0"?>
 <robot name="gcr16_2000" xmlns:xacro="http://www.ros.org/wiki/xacro">
-  <!-- PLACEHOLDER kinematics. Axes/xyz are cobot-typical guesses for 2m reach.
-       Tune against CAD before using this to replace the Panda. -->
-  <xacro:arg name="use_cad_meshes" default="false"/>
+  <!-- Pins from Fusion indicators via scripts/read_joint_indicators.py --ros-z-up.
+       World pins (m): J1 0,0,0.1176  J2 0.1239,0,0.2350  J3 0.133301,0,1.2125
+                       J4 0.103301,0,2.1090  J5 0.160801,0,2.1775  J6 0.229301,0,2.2350
+       Joint xyz is parent-relative (world-aligned frames, rpy 0).
+       mesh_xyz is -world_pin so assembly STLs still match the CAD statue at q=0. -->
+  <xacro:arg name="use_cad_meshes" default="true"/>
   <xacro:arg name="mesh_dir" default=""/>
   <xacro:include filename="gcr16_common.xacro"/>
 
@@ -23,7 +26,7 @@
       use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
   </link>
 
-  <xacro:macro name="gcr16_revolute" params="name parent child xyz rpy axis vel stl dummy_xyz dummy_size">
+  <xacro:macro name="gcr16_revolute" params="name parent child xyz rpy axis vel stl dummy_xyz dummy_size mesh_xyz">
     <joint name="${name}" type="revolute">
       <parent link="${parent}"/>
       <child link="${child}"/>
@@ -35,27 +38,34 @@
       <xacro:gcr16_cad_or_dummy
         link_name="${child}" stl_name="${stl}"
         dummy_xyz="${dummy_xyz}" dummy_size="${dummy_size}"
-        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"/>
+        use_cad_meshes="${use_cad}" mesh_dir="${mesh_dir}"
+        mesh_xyz="${mesh_xyz}"/>
     </link>
   </xacro:macro>
 
-  <!-- Joint speeds from the spec: 120, 180, 225 deg/s -> rad/s -->
+  <!-- Joint speeds from the spec: J1 120, J2 120, J3 180, J4-J6 225 deg/s. -->
   <xacro:gcr16_revolute name="gcr16_joint1" parent="base_link" child="gcr16_link1"
-    xyz="0 0 0.163" rpy="0 0 0" axis="0 0 1" vel="2.094"
-    stl="GCR16-J1.stl" dummy_xyz="0 0 0.08" dummy_size="0.14 0.14 0.16"/>
+    xyz="0 0 0.1176" rpy="0 0 0" axis="0 0 1" vel="2.094"
+    stl="GCR16-J1.stl" dummy_xyz="0 0 0.08" dummy_size="0.14 0.14 0.16"
+    mesh_xyz="0 0 -0.1176"/>
   <xacro:gcr16_revolute name="gcr16_joint2" parent="gcr16_link1" child="gcr16_link2"
-    xyz="0 0 0.000" rpy="0 0 0" axis="0 1 0" vel="3.142"
-    stl="GCR16-J2.stl" dummy_xyz="0 0 0.35" dummy_size="0.12 0.12 0.70"/>
+    xyz="0.1239 0 0.1174" rpy="0 0 0" axis="1 0 0" vel="2.094"
+    stl="GCR16-J2.stl" dummy_xyz="0 0 0.35" dummy_size="0.12 0.12 0.70"
+    mesh_xyz="-0.1239 0 -0.235"/>
   <xacro:gcr16_revolute name="gcr16_joint3" parent="gcr16_link2" child="gcr16_link3"
-    xyz="0 0 0.700" rpy="0 0 0" axis="0 1 0" vel="3.927"
-    stl="GCR16-J3.stl" dummy_xyz="0 0 0.25" dummy_size="0.11 0.11 0.50"/>
+    xyz="0.009401 0 0.9775" rpy="0 0 0" axis="-1 0 0" vel="3.142"
+    stl="GCR16-J3.stl" dummy_xyz="0 0 0.25" dummy_size="0.11 0.11 0.50"
+    mesh_xyz="-0.133301 0 -1.2125"/>
   <xacro:gcr16_revolute name="gcr16_joint4" parent="gcr16_link3" child="gcr16_link4"
-    xyz="0 0 0.500" rpy="0 0 0" axis="0 1 0" vel="3.927"
-    stl="GCR16-J4.stl" dummy_xyz="0 0 0.10" dummy_size="0.10 0.10 0.20"/>
+    xyz="-0.030 0 0.8965" rpy="0 0 0" axis="1 0 0" vel="3.927"
+    stl="GCR16-J4.stl" dummy_xyz="0 0 0.10" dummy_size="0.10 0.10 0.20"
+    mesh_xyz="-0.103301 0 -2.109"/>
   <xacro:gcr16_revolute name="gcr16_joint5" parent="gcr16_link4" child="gcr16_link5"
-    xyz="0 0 0.200" rpy="0 0 0" axis="0 1 0" vel="3.927"
-    stl="GCR16-J5.stl" dummy_xyz="0 0 0.09" dummy_size="0.09 0.09 0.18"/>
+    xyz="0.0575 0 0.0685" rpy="0 0 0" axis="0 0 1" vel="3.927"
+    stl="GCR16-J5.stl" dummy_xyz="0 0 0.09" dummy_size="0.09 0.09 0.18"
+    mesh_xyz="-0.160801 0 -2.1775"/>
   <xacro:gcr16_revolute name="gcr16_joint6" parent="gcr16_link5" child="gcr16_link6"
-    xyz="0 0 0.180" rpy="0 0 0" axis="0 0 1" vel="3.927"
-    stl="GCR16-J6.stl" dummy_xyz="0 0 0.04" dummy_size="0.08 0.08 0.08"/>
+    xyz="0.0685 0 0.0575" rpy="0 0 0" axis="1 0 0" vel="3.927"
+    stl="GCR16-J6.stl" dummy_xyz="0 0 0.04" dummy_size="0.08 0.08 0.08"
+    mesh_xyz="-0.229301 0 -2.235"/>
 </robot>
