@@ -7,17 +7,23 @@ HAWK="$(cd "${V1}/../../.." && pwd)"
 LINK_DIR="${HAWK}/isaac_sim_test/3d"
 MESH_DIR="${V1}/meshes"
 
+_link_step() {
+  # Print path to GCR16-Jn.step or .stp if it exists.
+  local i="$1"
+  if [ -f "${LINK_DIR}/GCR16-J${i}.step" ]; then
+    echo "${LINK_DIR}/GCR16-J${i}.step"
+  elif [ -f "${LINK_DIR}/GCR16-J${i}.stp" ]; then
+    echo "${LINK_DIR}/GCR16-J${i}.stp"
+  fi
+}
+
 need_export=0
 for i in 0 1 2 3 4 5 6; do
-  step=""
-  if [ -f "${LINK_DIR}/GCR16-J${i}.step" ]; then
-    step="${LINK_DIR}/GCR16-J${i}.step"
-  elif [ -f "${LINK_DIR}/GCR16-J${i}.stp" ]; then
-    step="${LINK_DIR}/GCR16-J${i}.stp"
-  fi
+  step="$(_link_step "${i}")"
   stl="${MESH_DIR}/GCR16-J${i}.stl"
   if [ -z "${step}" ]; then
     echo "Missing ${LINK_DIR}/GCR16-J${i}.step"
+    echo "Copy the seven Fusion link STEPs onto the sim box, then re-run."
     exit 1
   fi
   if [ ! -f "${stl}" ] || [ "${step}" -nt "${stl}" ]; then
@@ -26,13 +32,36 @@ for i in 0 1 2 3 4 5 6; do
 done
 
 if [ "${need_export}" -eq 1 ]; then
-  echo "Link STEPs newer than STLs — exporting meshes"
-  "${V1}/scripts/export_meshes.sh"
+  echo "Link STEPs newer than STLs — exporting per-link Fusion STEPs (not the full assembly)"
+  FC=""
+  for c in freecadcmd FreeCADCmd freecad.cmd; do
+    if command -v "${c}" >/dev/null 2>&1; then
+      FC="${c}"
+      break
+    fi
+  done
+  if [ -z "${FC}" ]; then
+    echo "Install FreeCAD: sudo apt install -y freecad"
+    exit 1
+  fi
+  export GCR16_LINK_DIR="${LINK_DIR}"
+  export GCR16_OUT="${MESH_DIR}"
+  echo "LINK_DIR ${GCR16_LINK_DIR}"
+  echo "OUT      ${GCR16_OUT}"
+  echo "FC       ${FC}"
+  "${FC}" "${V1}/scripts/export_link_steps_freecad.py"
+  python3 "${V1}/scripts/fix_stls.py" "${MESH_DIR}"
+  echo "--- meshes ---"
+  ls -lh "${MESH_DIR}"/GCR16-J*.stl
 fi
 
+# Humble setup.bash reads optional unset vars; set -u would abort before RViz.
+set +u
 # shellcheck disable=SC1091
 source /opt/ros/humble/setup.bash
+set -u
 # shellcheck disable=SC1091
 source "${V1}/scripts/use_local_pkg.sh"
 cd "${V1}"
+echo "Launching RViz sliders: python3 launch/display.launch.py mode:=move"
 exec python3 launch/display.launch.py mode:=move
