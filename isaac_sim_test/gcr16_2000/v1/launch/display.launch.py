@@ -2,6 +2,7 @@
 """Show GCR16-2000 v1 in RViz. Prefer mode:=assembled after you export STLs."""
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -17,40 +18,65 @@ def _v1_dir():
 
 
 def _register_ament_prefix(v1):
-    """Expose meshes via package://gcr16_2000_v1/... without a colcon install.
-
-    Humble RViz/resource_retriever often fails on file:// (libcurl blocks it).
-    """
+    """Build a real ament prefix so package://gcr16_2000_v1 resolves."""
     prefix = v1 / ".ament_prefix"
     share_pkg = prefix / "share" / "gcr16_2000_v1"
     share_pkg.mkdir(parents=True, exist_ok=True)
     meshes_link = share_pkg / "meshes"
-    if meshes_link.is_symlink() or meshes_link.exists():
+    if meshes_link.is_symlink():
         meshes_link.unlink()
-    meshes_link.symlink_to(v1 / "meshes", target_is_directory=True)
+    elif meshes_link.is_dir():
+        shutil.rmtree(meshes_link)
+    elif meshes_link.exists():
+        meshes_link.unlink()
+    meshes_link.symlink_to((v1 / "meshes").resolve(), target_is_directory=True)
     index_dir = prefix / "share" / "ament_index" / "resource_index" / "packages"
     index_dir.mkdir(parents=True, exist_ok=True)
     (index_dir / "gcr16_2000_v1").write_text("")
     return prefix
 
 
+def _fix_stls(mesh_dir):
+    """Rewrite STLs as binary if the helper script is present."""
+    fixer = _v1_dir() / "scripts" / "fix_stls.py"
+    if not fixer.is_file():
+        return
+    import runpy
+
+    sys.argv = [str(fixer), str(mesh_dir)]
+    try:
+        runpy.run_path(str(fixer), run_name="__main__")
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            print("[gcr16 v1] fix_stls exit", exc.code)
+
+
 def _launch_setup(context, *args, **kwargs):
     """Build robot_description and start display nodes."""
     v1 = _v1_dir()
     prefix = _register_ament_prefix(v1)
+    ament = str(prefix) + os.pathsep + os.environ.get("AMENT_PREFIX_PATH", "")
+    os.environ["AMENT_PREFIX_PATH"] = ament
+
     mode = LaunchConfiguration("mode").perform(context)
     use_cad = LaunchConfiguration("use_cad_meshes").perform(context)
     mesh_dir = LaunchConfiguration("mesh_dir").perform(context)
     if not mesh_dir:
         mesh_dir = str(v1 / "meshes")
 
+    if use_cad.lower() in ("true", "1"):
+        _fix_stls(mesh_dir)
+
     stl0 = Path(mesh_dir) / "GCR16-J0.stl"
+    resolved = prefix / "share" / "gcr16_2000_v1" / "meshes" / "GCR16-J0.stl"
+    print("[gcr16 v1] AMENT prefix", prefix)
+    print("[gcr16 v1] resolved mesh", resolved, "exists", resolved.is_file())
     if stl0.is_file():
-        print(f"[gcr16 v1] mesh {stl0} size={stl0.stat().st_size} bytes")
+        print(f"[gcr16 v1] {stl0} size={stl0.stat().st_size} bytes")
     if use_cad.lower() in ("true", "1") and (not stl0.is_file() or stl0.stat().st_size < 80):
         print(
             f"[gcr16 v1] Missing or empty {stl0} — using dummy boxes. "
-            "Run ./scripts/export_meshes.sh on the sim box."
+            "Run ./scripts/export_meshes.sh then python3 scripts/fix_stls.py"
         )
         use_cad = "false"
 
@@ -66,14 +92,8 @@ def _launch_setup(context, *args, **kwargs):
         mappings={"use_cad_meshes": use_cad, "mesh_dir": mesh_dir},
     ).toxml()
 
-    ament = str(prefix) + os.pathsep + os.environ.get("AMENT_PREFIX_PATH", "")
-    os.environ["AMENT_PREFIX_PATH"] = ament
-
     rviz_cfg = v1 / "rviz" / "display.rviz"
-    env = dict(os.environ)
-    env["AMENT_PREFIX_PATH"] = ament
-    nodes = [
-        SetEnvironmentVariable("AMENT_PREFIX_PATH", ament),
+    return [
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
@@ -91,13 +111,17 @@ def _launch_setup(context, *args, **kwargs):
             additional_env={"AMENT_PREFIX_PATH": ament},
         ),
     ]
-    return nodes
 
 
 def generate_launch_description():
     """RViz display: assembled CAD pose (default) or placeholder moving joints."""
+    v1 = _v1_dir()
+    prefix = _register_ament_prefix(v1)
+    ament = str(prefix) + os.pathsep + os.environ.get("AMENT_PREFIX_PATH", "")
+    os.environ["AMENT_PREFIX_PATH"] = ament
     return LaunchDescription(
         [
+            SetEnvironmentVariable("AMENT_PREFIX_PATH", ament),
             DeclareLaunchArgument("mode", default_value="assembled"),
             DeclareLaunchArgument("use_cad_meshes", default_value="true"),
             DeclareLaunchArgument("mesh_dir", default_value=""),
