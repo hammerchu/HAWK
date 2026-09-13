@@ -106,24 +106,35 @@ def _launch_setup(context, *args, **kwargs):
     ).toxml()
 
     rviz_cfg = v1 / "rviz" / "display.rviz"
-    return [
+    js_remap = [("joint_states", "/gcr16/joint_states")]
+    nodes = [
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             parameters=[{"robot_description": robot_desc, "use_sim_time": False}],
+            remappings=js_remap + [("robot_description", "/gcr16/robot_description")],
             additional_env={"AMENT_PREFIX_PATH": ament},
         ),
-        Node(
-            package="joint_state_publisher_gui",
-            executable="joint_state_publisher_gui",
-        ),
+    ]
+    # Assembled URDF is all fixed joints. jsp_gui then emits empty/mismatched
+    # JointState, and leftover Panda /joint_states also looks "invalid".
+    if mode == "move":
+        nodes.append(
+            Node(
+                package="joint_state_publisher_gui",
+                executable="joint_state_publisher_gui",
+                remappings=js_remap,
+            )
+        )
+    nodes.append(
         Node(
             package="rviz2",
             executable="rviz2",
             arguments=["-d", str(rviz_cfg)] if rviz_cfg.exists() else [],
             additional_env={"AMENT_PREFIX_PATH": ament},
-        ),
-    ]
+        )
+    )
+    return nodes
 
 
 def generate_launch_description():

@@ -14,7 +14,7 @@ Visualization Manager:
       Name: RobotModel
       Enabled: true
       Description Topic:
-        Value: /robot_description
+        Value: /gcr16/robot_description
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
