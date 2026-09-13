@@ -4,7 +4,7 @@ set -euo pipefail
 
 V1="$(cd "$(dirname "$0")/.." && pwd)"
 HAWK="$(cd "${V1}/../../.." && pwd)"
-STEP="${STEP_PATH:-${HAWK}/isaac_sim_test/3d/新松机器人机械手机械臂 GCR16-2000.STEP}"
+STEP="${STEP_PATH:-${HAWK}/isaac_sim_test/3d/GCR16-2000.STEP}"
 OUT="${MESH_OUT:-${V1}/meshes}"
 SCRIPT="${V1}/scripts/export_meshes_freecad.py"
 
