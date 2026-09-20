@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -100,6 +101,8 @@ def _fmt_pt(pt):
 def write_window_usda(path, pose, s_cad, l_cad):
     """Write a Z-up metres USDA: parent Xform + S/L curves + FBX child xform."""
     tx, ty, tz = pose["translation_m"]
+    roll, pitch, yaw = pose["rpy_rad"]
+    rx, ry, rz = [math.degrees(a) for a in (roll, pitch, yaw)]
     w, x, y, z = fbx_child_orient_wxyz()
     scale = float(pose.get("fbx_scale", 0.01))
     fbx_rel = "../../3d/windows.fbx"
@@ -116,7 +119,8 @@ def write_window_usda(path, pose, s_cad, l_cad):
 def Xform "window_frame"
 {{
     double3 xformOp:translate = ({tx:.6f}, {ty:.6f}, {tz:.6f})
-    uniform token[] xformOpOrder = ["xformOp:translate"]
+    float3 xformOp:rotateXYZ = ({rx:.6f}, {ry:.6f}, {rz:.6f})
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
 
     def Xform "window_geo" (
         prepend references = @{fbx_rel}@

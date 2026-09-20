@@ -1,8 +1,8 @@
 {
-  "comment": "ONE parent pose for window mesh and S/L paths. Edit this file, then re-run export_aligned.py. CAD-local ROS m = Fusion cm/100 then (x,y,z)->(x,-z,y). Default puts the S pane in GCR reach (~2 m) in front of the base.",
+  "comment": "ONE parent pose for window mesh and S/L paths. Isaac window_frame translate + rotateXYZ deg copied 2026-09-20. Rx -90 lays the pane toward XY. Do not File>Add this USDA again on a prim that already has this xform.",
   "parent_frame": "world",
-  "translation_m": [-0.753098, -0.20, 1.147811],
-  "rpy_rad": [0.0, 0.0, 0.0],
+  "translation_m": [-0.753098, 0.584718, 0.087103],
+  "rpy_rad": [-1.5707963267948966, 0.0, 0.0],
   "approach_offset_m": 0.02,
   "spacing_m": 0.03,
   "fbx_scale": 0.01,
