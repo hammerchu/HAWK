@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 import signal
 import sys
 from pathlib import Path
@@ -76,6 +77,22 @@ def dist3(a, b):
     ax, ay, az = (a.x, a.y, a.z) if hasattr(a, "x") else a
     bx, by, bz = (b.x, b.y, b.z) if hasattr(b, "x") else b
     return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2)
+
+
+def xyz_of(point):
+    """Return an (x, y, z) tuple from a Point, Pose, or 3-tuple."""
+    if hasattr(point, "position"):
+        return (point.position.x, point.position.y, point.position.z)
+    if hasattr(point, "x"):
+        return (point.x, point.y, point.z)
+    return (float(point[0]), float(point[1]), float(point[2]))
+
+
+def lerp3(a, b, t):
+    """Linear interpolate two xyz triples. t=0 is a, t=1 is b."""
+    ax, ay, az = a
+    bx, by, bz = b
+    return (ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t)
 
 
 class SPathFollower(Node):
@@ -336,32 +353,70 @@ class SPathFollower(Node):
             ("identity", quat_from_rpy(0.0, 0.0, 0.0)),
         ]
 
-    def compute_ik(self, xyz, orientation):
+    def _seed_robot_state(self, joint_state=None):
+        """Build a full RobotState seed from a JointState (current arm if omitted)."""
+        seed = joint_state if joint_state is not None else self._last_joint_state
+        state = RobotState()
+        if seed is None:
+            state.is_diff = True
+            return state
+        state.is_diff = False
+        state.joint_state = seed
+        return state
+
+    def compute_ik(self, xyz, orientation, seed_js=None, set_link_name=True):
         """Call MoveIt GetPositionIK for one pose. Return JointState or None."""
         if not self.ik_client.wait_for_service(timeout_sec=5.0):
             raise RuntimeError("/compute_ik is missing. Is move_group running?")
         pose = PoseStamped()
         pose.header.frame_id = self.base_frame
-        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.stamp = rclpy.time.Time().to_msg()
         pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = xyz
         pose.pose.orientation = orientation
         request = GetPositionIK.Request()
         request.ik_request = PositionIKRequest()
         request.ik_request.group_name = self.group_name
-        request.ik_request.ik_link_name = self.ee_frame
+        if set_link_name:
+            request.ik_request.ik_link_name = self.ee_frame
         request.ik_request.pose_stamped = pose
-        request.ik_request.avoid_collisions = self.avoid_collisions
-        request.ik_request.timeout.sec = 2
-        request.ik_request.robot_state = RobotState()
-        request.ik_request.robot_state.is_diff = True
+        request.ik_request.avoid_collisions = False
+        request.ik_request.timeout.sec = 1
+        request.ik_request.robot_state = self._seed_robot_state(seed_js)
         future = self.ik_client.call_async(request)
-        self.wait_for_future(future, timeout_sec=5.0)
+        self.wait_for_future(future, timeout_sec=3.0)
         if self._stop_requested:
             raise KeyboardInterrupt
         response = future.result()
-        if response is None or response.error_code.val != MOVEIT_SUCCESS:
+        if response is None:
+            self._last_ik_code = None
             return None
+        if response.error_code.val != MOVEIT_SUCCESS:
+            self._last_ik_code = response.error_code.val
+            return None
+        self._last_ik_code = MOVEIT_SUCCESS
         return response.solution.joint_state
+
+    def compute_ik_with_retries(self, xyz, orientation, seed_js=None, attempts=8):
+        """IK with current seed, then noisy joint seeds if KDL needs a kick."""
+        seeds = [seed_js]
+        base = seed_js if seed_js is not None else self._last_joint_state
+        if base is not None:
+            for _ in range(max(0, attempts - 1)):
+                noisy = JointState()
+                noisy.name = list(base.name)
+                noisy.position = []
+                for name, pos in zip(base.name, base.position):
+                    jitter = random.uniform(-0.45, 0.45) if name in ARM_JOINTS else 0.0
+                    noisy.position.append(pos + jitter)
+                seeds.append(noisy)
+        for seed in seeds:
+            js = self.compute_ik(xyz, orientation, seed_js=seed, set_link_name=True)
+            if js is not None:
+                return js
+            js = self.compute_ik(xyz, orientation, seed_js=seed, set_link_name=False)
+            if js is not None:
+                return js
+        return None
 
     def execute_joint_positions(self, names, positions, duration_sec):
         """Send a 2-point joint-space move from the current arm state to positions."""
@@ -412,8 +467,83 @@ class SPathFollower(Node):
         self._goal_handle = None
         return result_future.result().result
 
+    def execute_joint_path(self, names, points, duration_sec):
+        """Stream a multi-point joint-space path (seeded IK walk) to the controller."""
+        if not points:
+            raise RuntimeError("Empty joint path.")
+        if not self.follow_client.wait_for_server(timeout_sec=10.0):
+            raise RuntimeError("{} is missing.".format(self.controller_action))
+        start_names, start_pos = self._arm_joints_from(self._last_joint_state)
+        traj = JointTrajectory()
+        traj.joint_names = list(start_names)
+        count = len(points)
+        t_total = max(1.0, float(duration_sec))
+        start = JointTrajectoryPoint()
+        start.positions = list(start_pos)
+        start.time_from_start.sec = 0
+        traj.points.append(start)
+        for i, pos in enumerate(points):
+            if list(names) != list(start_names):
+                idx = {n: j for j, n in enumerate(names)}
+                pos = [pos[idx[n]] for n in start_names]
+            point = JointTrajectoryPoint()
+            point.positions = [float(p) for p in pos]
+            t = t_total * (i + 1) / float(count)
+            point.time_from_start.sec = int(t)
+            point.time_from_start.nanosec = int((t - int(t)) * 1e9)
+            traj.points.append(point)
+        action_goal = FollowJointTrajectory.Goal()
+        action_goal.trajectory = traj
+        self.get_logger().info(
+            "IK-walk execute {} pts over {:.1f}s".format(len(traj.points), t_total)
+        )
+        send_future = self.follow_client.send_goal_async(action_goal)
+        self.wait_for_future(send_future, timeout_sec=10.0)
+        if self._stop_requested:
+            raise KeyboardInterrupt
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError("Approach FollowJointTrajectory was rejected.")
+        self._goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        self.wait_for_future(result_future, timeout_sec=t_total + 5.0)
+        if self._stop_requested:
+            self.stop_motion_now()
+            raise KeyboardInterrupt
+        self._goal_handle = None
+        return result_future.result().result
+
+    def walk_ik_to(self, target_xyz, orientation, step_m=0.07):
+        """Seeded IK along a straight line in tip space. Return True if the tip arrives."""
+        tip = self.lookup_current_tip_pose()
+        start = xyz_of(tip)
+        gap = dist3(start, target_xyz)
+        steps = max(1, int(math.ceil(gap / step_m)))
+        self.get_logger().info(
+            "IK walk {} steps, {:.3f}m, keep current wrist.".format(steps, gap)
+        )
+        seed = self._last_joint_state
+        path = []
+        names = ARM_JOINTS
+        for i in range(1, steps + 1):
+            xyz = lerp3(start, target_xyz, i / float(steps))
+            js = self.compute_ik_with_retries(xyz, orientation, seed_js=seed, attempts=6)
+            if js is None:
+                self.get_logger().warn(
+                    "IK walk died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={}".format(
+                        i, steps, xyz[0], xyz[1], xyz[2], getattr(self, "_last_ik_code", "?")
+                    )
+                )
+                return False
+            names, pos = self._arm_joints_from(js)
+            path.append(pos)
+            seed = js
+        duration = max(4.0, min(18.0, steps * 0.45))
+        self.execute_joint_path(names, path, duration)
+        return True
+
     def approach_first_corner(self, tip):
-        """Joint-space IK to the nearest S corner with a reachable wrist. Return orientation."""
+        """Walk seeded IK to the nearest S corner, keeping the current wrist. Return orientation."""
         corner_i, gap = self.nearest_corner_index(tip)
         xyz = self.corners_world[corner_i]
         self.get_logger().info(
@@ -421,28 +551,36 @@ class SPathFollower(Node):
                 corner_i, xyz[0], xyz[1], xyz[2], gap
             )
         )
-        last_err = "no IK"
-        for name, orientation in self.orientation_candidates(tip):
-            js = self.compute_ik(xyz, orientation)
-            if js is None:
-                self.get_logger().info("IK miss with orientation {}".format(name))
-                continue
-            try:
-                names, positions = self._arm_joints_from(js)
-            except RuntimeError as exc:
-                last_err = str(exc)
-                continue
-            self.get_logger().info("IK hit with {} — moving in joint space.".format(name))
-            self.execute_joint_positions(names, positions, self.approach_duration_sec)
-            ordered = self.corners_world[corner_i:] + self.corners_world[:corner_i]
-            spacing = float(self.pose.get("spacing_m", 0.03))
-            self.waypoints_world = densify_closed(ordered, spacing)
-            return orientation
-        raise RuntimeError(
-            "No IK to the S pane from home ({}) . Edit window_frame.json translation_m.".format(
-                last_err
+        orientation = tip.orientation
+        if not self.walk_ik_to(xyz, orientation):
+            # High corner first (closer to home Z), then the rest.
+            order = sorted(
+                range(len(self.corners_world)),
+                key=lambda i: -self.corners_world[i][2],
             )
-        )
+            hit = False
+            for idx in order:
+                if idx == corner_i:
+                    continue
+                alt = self.corners_world[idx]
+                self.get_logger().info(
+                    "Retry walk to corner {} ({:.3f},{:.3f},{:.3f})".format(
+                        idx, alt[0], alt[1], alt[2]
+                    )
+                )
+                if self.walk_ik_to(alt, orientation):
+                    corner_i = idx
+                    hit = True
+                    break
+            if not hit:
+                raise RuntimeError(
+                    "No seeded IK walk to the S pane. Check kinematics.yaml is not "
+                    "empty in install/, then retry. Frame should be base_link."
+                )
+        ordered = self.corners_world[corner_i:] + self.corners_world[:corner_i]
+        spacing = float(self.pose.get("spacing_m", 0.03))
+        self.waypoints_world = densify_closed(ordered, spacing)
+        return orientation
 
     def sample_path_waypoints(self, tip_orientation: Quaternion):
         """Stamp S world positions with a fixed joint6 orientation."""
