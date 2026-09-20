@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import random
 import signal
 import sys
 from pathlib import Path
@@ -19,7 +18,7 @@ import rclpy
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
 from moveit_msgs.msg import PositionIKRequest, RobotState
-from moveit_msgs.srv import GetCartesianPath, GetPositionIK
+from moveit_msgs.srv import GetCartesianPath, GetPositionFK, GetPositionIK
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -51,6 +50,24 @@ ARM_JOINTS = [
     "gcr16_joint6",
 ]
 MOVEIT_SUCCESS = 1
+# Humble MoveItErrorCodes: -21 is FRAME_TRANSFORM_FAILURE, not ROBOT_STATE_STALE (-23).
+MOVEIT_ERROR_NAMES = {
+    1: "SUCCESS",
+    -12: "GOAL_IN_COLLISION",
+    -15: "INVALID_GROUP_NAME",
+    -17: "INVALID_ROBOT_STATE",
+    -18: "INVALID_LINK_NAME",
+    -21: "FRAME_TRANSFORM_FAILURE",
+    -23: "ROBOT_STATE_STALE",
+    -31: "NO_IK_SOLUTION",
+}
+
+
+def moveit_error_name(code):
+    """Return the Humble MoveItErrorCodes name for a numeric val."""
+    if code is None:
+        return "none"
+    return MOVEIT_ERROR_NAMES.get(int(code), str(code))
 
 
 def load_s_world_waypoints(pose):
@@ -132,7 +149,10 @@ class SPathFollower(Node):
         self._static_tf = StaticTransformBroadcaster(self)
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
+        self.fk_client = self.create_client(GetPositionFK, "/compute_fk")
         self._param_client = self.create_client(GetParameters, "/move_group/get_parameters")
+        self._model_frame = None
+        self._published_world_base = False
         self.follow_client = ActionClient(self, FollowJointTrajectory, self.controller_action)
         self._goal_handle = None
         self._stop_requested = False
@@ -151,8 +171,8 @@ class SPathFollower(Node):
         signal.signal(signal.SIGINT, self._on_stop_signal)
         signal.signal(signal.SIGTERM, self._on_stop_signal)
 
-    def _publish_window_tf(self):
-        """Broadcast world -> window_frame so RViz and the path share one parent."""
+    def _window_tf_msg(self):
+        """Build the world → window_frame static transform from window_frame.json."""
         tx, ty, tz = self.pose["translation_m"]
         qx, qy, qz, qw = rpy_to_quat_xyzw(*self.pose["rpy_rad"])
         msg = TransformStamped()
@@ -166,7 +186,23 @@ class SPathFollower(Node):
         msg.transform.rotation.y = qy
         msg.transform.rotation.z = qz
         msg.transform.rotation.w = qw
-        self._static_tf.sendTransform(msg)
+        return msg
+
+    def _world_base_tf_msg(self):
+        """Build identity world → base_link, matching URDF world_to_base."""
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.pose.get("parent_frame", "world")
+        msg.child_frame_id = self.base_frame
+        msg.transform.rotation.w = 1.0
+        return msg
+
+    def _publish_window_tf(self):
+        """Broadcast static TFs together so one sendTransform cannot wipe the other."""
+        msgs = [self._window_tf_msg()]
+        if self._published_world_base:
+            msgs.append(self._world_base_tf_msg())
+        self._static_tf.sendTransform(msgs)
 
     def _joint_state_is_ready(self, js):
         """True when a JointState actually contains the GCR arm joints."""
@@ -254,7 +290,9 @@ class SPathFollower(Node):
             js_ok = self._joint_state_is_ready(self._last_joint_state)
             if cart_ok and isaac_ok and js_ok:
                 self.get_logger().info("MoveIt + Isaac Play are live.")
+                self.ensure_world_base_tf()
                 self.log_move_group_kinematics()
+                self.get_logger().info("planning_frame={}".format(self.planning_frame()))
                 return
             now = self.get_clock().now().nanoseconds / 1e9
             if now - last_nudge > 10.0:
@@ -292,12 +330,13 @@ class SPathFollower(Node):
     def probe_cartesian_here(self, tip):
         """Ask GetCartesianPath for the pose we already have. True if fraction is ~1."""
         response = self.compute_cartesian_path([tip])
+        code = response.error_code.val
         self.get_logger().info(
-            "Cartesian probe fraction={:.2f} error={}".format(
-                response.fraction, response.error_code.val
+            "Cartesian probe fraction={:.2f} error={} ({})".format(
+                response.fraction, code, moveit_error_name(code)
             )
         )
-        return response.fraction >= 0.99
+        return response.fraction >= 0.99 and code == MOVEIT_SUCCESS
 
     def lookup_current_tip_pose(self, timeout_sec=5.0):
         """Read the current joint6 tip pose in the robot base frame from TF."""
@@ -398,22 +437,13 @@ class SPathFollower(Node):
         slim.position = [float(p) for p in positions]
         return slim
 
-    def _fresh_start_state(self):
-        """RobotState MoveIt will accept (stamped joints). Empty is_diff hits ROBOT_STATE_STALE."""
-        state = RobotState()
-        seed = self._last_joint_state or self._isaac_joint_state
-        if seed is None:
-            state.is_diff = True
-            return state
-        state.is_diff = False
-        state.joint_state = self._arm_only_js(seed)
-        return state
-
     def _seed_robot_state(self, joint_state=None):
-        """Diff-seed MoveIt with the 6 arm joints. A full is_diff=False state breaks KDL."""
+        """Diff-seed MoveIt with the 6 arm joints. is_diff=False with only 6 joints is incomplete."""
         state = RobotState()
         state.is_diff = True
-        seed = joint_state if joint_state is not None else self._last_joint_state
+        seed = joint_state if joint_state is not None else (
+            self._last_joint_state or self._isaac_joint_state
+        )
         if seed is None:
             return state
         try:
@@ -422,12 +452,78 @@ class SPathFollower(Node):
             state.joint_state = seed
         return state
 
+    def _fresh_start_state(self):
+        """Same as a diff seed of the live arm — used by Cartesian and IK."""
+        return self._seed_robot_state()
+
+    def planning_frame(self):
+        """Return MoveIt's model frame (URDF root). Cartesian must stamp poses in this frame."""
+        if self._model_frame:
+            return self._model_frame
+        fk = self.compute_fk(self.ee_frame)
+        if fk is not None and fk.header.frame_id:
+            self._model_frame = fk.header.frame_id
+            return self._model_frame
+        return self.pose.get("parent_frame", "world")
+
+    def ensure_world_base_tf(self):
+        """Publish identity world→base_link when that TF is missing (Humble Cartesian needs it)."""
+        if self._published_world_base:
+            return
+        world = self.pose.get("parent_frame", "world")
+        deadline = self.get_clock().now() + Duration(seconds=1.0)
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            try:
+                self.tf_buffer.lookup_transform(world, self.base_frame, rclpy.time.Time())
+                return
+            except Exception:
+                rclpy.spin_once(self, timeout_sec=0.1)
+        self._published_world_base = True
+        self._publish_window_tf()
+        self.get_logger().warn(
+            "No TF {}→{}; publishing identity (matches URDF world_to_base).".format(
+                world, self.base_frame
+            )
+        )
+
+    def compute_fk(self, link_name, joint_state=None):
+        """Call MoveIt GetPositionFK. Pose is stamped in the model frame."""
+        if not self.fk_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("/compute_fk is missing.")
+            return None
+        request = GetPositionFK.Request()
+        request.fk_link_names = [link_name]
+        request.robot_state = self._seed_robot_state(joint_state)
+        future = self.fk_client.call_async(request)
+        self.wait_for_future(future, timeout_sec=2.0)
+        if self._stop_requested:
+            raise KeyboardInterrupt
+        response = future.result()
+        if response is None or response.error_code.val != MOVEIT_SUCCESS:
+            code = None if response is None else response.error_code.val
+            self.get_logger().warn(
+                "GetPositionFK failed code={} ({})".format(code, moveit_error_name(code))
+            )
+            return None
+        if not response.pose_stamped:
+            return None
+        return response.pose_stamped[0]
+
+    def lookup_tip_in_planning_frame(self):
+        """Prefer MoveIt FK (model frame) so IK/Cartesian poses match the request header."""
+        fk = self.compute_fk(self.ee_frame)
+        if fk is not None:
+            if fk.header.frame_id:
+                self._model_frame = fk.header.frame_id
+            return fk.pose
+        return self.lookup_current_tip_pose()
+
     def compute_ik(self, xyz, orientation, seed_js=None, set_link_name=True, frame_id=None):
         """Call MoveIt GetPositionIK for one pose. Return JointState or None."""
         if not self.ik_client.wait_for_service(timeout_sec=5.0):
             raise RuntimeError("/compute_ik is missing. Is move_group running?")
         pose = PoseStamped()
-        pose.header.frame_id = frame_id or self.base_frame
+        pose.header.frame_id = frame_id or self.planning_frame()
         pose.header.stamp = rclpy.time.Time().to_msg()
         pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = xyz
         pose.pose.orientation = orientation
@@ -438,13 +534,11 @@ class SPathFollower(Node):
             request.ik_request.ik_link_name = self.ee_frame
         request.ik_request.pose_stamped = pose
         request.ik_request.avoid_collisions = False
-        request.ik_request.timeout.sec = 1
+        request.ik_request.timeout.sec = 2
         request.ik_request.timeout.nanosec = 0
-        request.ik_request.robot_state = (
-            self._fresh_start_state() if seed_js is None else self._seed_robot_state(seed_js)
-        )
+        request.ik_request.robot_state = self._seed_robot_state(seed_js)
         future = self.ik_client.call_async(request)
-        self.wait_for_future(future, timeout_sec=2.0)
+        self.wait_for_future(future, timeout_sec=4.0)
         if self._stop_requested:
             raise KeyboardInterrupt
         response = future.result()
@@ -458,24 +552,30 @@ class SPathFollower(Node):
         return response.solution.joint_state
 
     def compute_ik_with_retries(self, xyz, orientation, seed_js=None, attempts=3):
-        """IK with a scene diff seed; skip noisy bombs that used to explode the robot state."""
-        frames = [self.base_frame, "world"]
-        for frame in frames:
-            for set_link in (True, False):
-                js = self.compute_ik(
-                    xyz, orientation, seed_js=seed_js, set_link_name=set_link, frame_id=frame
-                )
-                if js is not None:
-                    return js
+        """IK in the planning frame with the group tip link. Retries keep a stable request."""
+        del attempts
+        for set_link in (True, False):
+            js = self.compute_ik(
+                xyz, orientation, seed_js=seed_js, set_link_name=set_link
+            )
+            if js is not None:
+                return js
         return None
 
     def probe_ik_at_current_tip(self, tip):
-        """IK to the pose we already have. If this fails, the solver/request is broken."""
+        """IK to MoveIt's FK pose. Failure at all-zero stretch is a KDL singularity, not a dead plugin."""
         xyz = xyz_of(tip)
         q = tip.orientation
         self.get_logger().info(
-            "IK probe at current tip xyz=({:.3f},{:.3f},{:.3f}) quat=({:.3f},{:.3f},{:.3f},{:.3f})".format(
-                xyz[0], xyz[1], xyz[2], q.x, q.y, q.z, q.w
+            "IK probe in {} xyz=({:.3f},{:.3f},{:.3f}) quat=({:.3f},{:.3f},{:.3f},{:.3f})".format(
+                self.planning_frame(),
+                xyz[0],
+                xyz[1],
+                xyz[2],
+                q.x,
+                q.y,
+                q.z,
+                q.w,
             )
         )
         js = self.compute_ik_with_retries(xyz, q, seed_js=None, attempts=1)
@@ -493,13 +593,41 @@ class SPathFollower(Node):
                 )
             except RuntimeError as exc:
                 self.get_logger().warn(str(exc))
-        self.get_logger().error(
-            "IK probe FAILED code={}. KDL never solved the pose the arm is already in. "
-            "Check install kinematics.yaml for duco_arm and that RViz can Plan.".format(
-                getattr(self, "_last_ik_code", "?")
+        code = getattr(self, "_last_ik_code", None)
+        self.get_logger().warn(
+            "IK probe FAILED code={} ({}). Stretched all-zero is a KDL singularity; "
+            "will joint-space jog off the pole if needed.".format(
+                code, moveit_error_name(code)
             )
         )
         return False
+
+    def arm_near_zero(self, eps=0.08):
+        """True when gcr16_joint1..6 are all near zero (fully stretched GCR home)."""
+        seed = self._last_joint_state or self._isaac_joint_state
+        if seed is None:
+            return False
+        try:
+            _, pos = self._arm_joints_from(seed)
+        except RuntimeError:
+            return False
+        return max(abs(p) for p in pos) < eps
+
+    def jog_off_singularity(self):
+        """Fold j2/j3 a little in joint space so KDL can leave the stretched pole."""
+        seed = self._last_joint_state or self._isaac_joint_state
+        if seed is None:
+            return False
+        names, pos = self._arm_joints_from(seed)
+        target = list(pos)
+        target[1] = pos[1] + 0.40
+        target[2] = pos[2] + 0.40
+        self.get_logger().info(
+            "All-zero stretch is a KDL singularity — joint-space jog j2/j3 +0.40 rad."
+        )
+        self.execute_joint_positions(names, target, duration_sec=4.0)
+        rclpy.spin_once(self, timeout_sec=0.2)
+        return True
 
     def cartesian_nudge(self, xyz, orientation):
         """One Cartesian waypoint from the current state. Return a RobotTrajectory or None."""
@@ -609,7 +737,7 @@ class SPathFollower(Node):
 
     def walk_ik_to(self, target_xyz, orientation, step_m=0.07):
         """Walk the tip in small steps: IK if it works, else a short Cartesian nudge."""
-        tip = self.lookup_current_tip_pose()
+        tip = self.lookup_tip_in_planning_frame()
         start = xyz_of(tip)
         gap = dist3(start, target_xyz)
         steps = max(1, int(math.ceil(gap / step_m)))
@@ -633,9 +761,16 @@ class SPathFollower(Node):
                 path = []
             cart = self.cartesian_nudge(xyz, orientation)
             if cart is None:
+                code = getattr(self, "_last_ik_code", None)
                 self.get_logger().warn(
-                    "IK+Cartesian died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={}".format(
-                        i, steps, xyz[0], xyz[1], xyz[2], getattr(self, "_last_ik_code", "?")
+                    "IK+Cartesian died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={} ({})".format(
+                        i,
+                        steps,
+                        xyz[0],
+                        xyz[1],
+                        xyz[2],
+                        code,
+                        moveit_error_name(code),
                     )
                 )
                 return False
@@ -654,18 +789,23 @@ class SPathFollower(Node):
 
     def approach_first_corner(self, tip):
         """Walk to the nearest S corner, keeping the current wrist. Return orientation."""
+        del tip
+        self.ensure_world_base_tf()
+        tip = self.lookup_tip_in_planning_frame()
         ik_ok = self.probe_ik_at_current_tip(tip)
         cart_ok = self.probe_cartesian_here(tip)
+        if (not ik_ok or not cart_ok) and self.arm_near_zero():
+            self.jog_off_singularity()
+            tip = self.lookup_tip_in_planning_frame()
+            ik_ok = self.probe_ik_at_current_tip(tip)
+            cart_ok = self.probe_cartesian_here(tip)
         if not ik_ok and not cart_ok:
-            raise RuntimeError(
-                "Both /compute_ik and /compute_cartesian_path failed at the current tip. "
-                "Look for live kinematics_solver= above — it must be "
-                "kdl_kinematics_plugin/KDLKinematicsPlugin, not empty/null. "
-                "Restart MoveIt after sourcing install/setup.bash."
-            )
-        if not ik_ok:
             self.get_logger().warn(
-                "GetPositionIK is dead; approach will use Cartesian nudges only."
+                "Probes still failing after jog; trying the IK walk anyway."
+            )
+        elif not ik_ok:
+            self.get_logger().warn(
+                "GetPositionIK is weak at this pose; approach will prefer Cartesian nudges."
             )
         corner_i, gap = self.nearest_corner_index(tip)
         xyz = self.corners_world[corner_i]
@@ -722,9 +862,9 @@ class SPathFollower(Node):
             raise RuntimeError("/compute_cartesian_path is missing. Is move_group running?")
 
         request = GetCartesianPath.Request()
-        request.header.frame_id = self.base_frame
-        request.header.stamp = self.get_clock().now().to_msg()
-        request.start_state = self._fresh_start_state()
+        request.header.frame_id = self.planning_frame()
+        request.header.stamp = rclpy.time.Time().to_msg()
+        request.start_state = self._seed_robot_state()
         request.group_name = self.group_name
         request.link_name = self.ee_frame
         request.waypoints = waypoints
@@ -869,8 +1009,10 @@ def main():
         waypoints = node.sample_path_waypoints(orientation)
         cartesian = node.compute_cartesian_path(waypoints)
         node.get_logger().info(
-            "Cartesian fraction={:.2f} error={}".format(
-                cartesian.fraction, cartesian.error_code.val
+            "Cartesian fraction={:.2f} error={} ({})".format(
+                cartesian.fraction,
+                cartesian.error_code.val,
+                moveit_error_name(cartesian.error_code.val),
             )
         )
         if cartesian.fraction < 0.99:
