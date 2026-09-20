@@ -353,23 +353,33 @@ class SPathFollower(Node):
             ("identity", quat_from_rpy(0.0, 0.0, 0.0)),
         ]
 
+    def _arm_only_js(self, joint_state):
+        """Keep only gcr16_joint1..6 so a seed cannot wipe the rest of the robot."""
+        names, positions = self._arm_joints_from(joint_state)
+        slim = JointState()
+        slim.name = list(names)
+        slim.position = [float(p) for p in positions]
+        return slim
+
     def _seed_robot_state(self, joint_state=None):
-        """Build a full RobotState seed from a JointState (current arm if omitted)."""
-        seed = joint_state if joint_state is not None else self._last_joint_state
+        """Diff-seed MoveIt with the 6 arm joints. A full is_diff=False state breaks KDL."""
         state = RobotState()
+        state.is_diff = True
+        seed = joint_state if joint_state is not None else self._last_joint_state
         if seed is None:
-            state.is_diff = True
             return state
-        state.is_diff = False
-        state.joint_state = seed
+        try:
+            state.joint_state = self._arm_only_js(seed)
+        except RuntimeError:
+            state.joint_state = seed
         return state
 
-    def compute_ik(self, xyz, orientation, seed_js=None, set_link_name=True):
+    def compute_ik(self, xyz, orientation, seed_js=None, set_link_name=True, frame_id=None):
         """Call MoveIt GetPositionIK for one pose. Return JointState or None."""
         if not self.ik_client.wait_for_service(timeout_sec=5.0):
             raise RuntimeError("/compute_ik is missing. Is move_group running?")
         pose = PoseStamped()
-        pose.header.frame_id = self.base_frame
+        pose.header.frame_id = frame_id or self.base_frame
         pose.header.stamp = rclpy.time.Time().to_msg()
         pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = xyz
         pose.pose.orientation = orientation
@@ -380,10 +390,11 @@ class SPathFollower(Node):
             request.ik_request.ik_link_name = self.ee_frame
         request.ik_request.pose_stamped = pose
         request.ik_request.avoid_collisions = False
-        request.ik_request.timeout.sec = 1
+        request.ik_request.timeout.sec = 0
+        request.ik_request.timeout.nanosec = int(0.2 * 1e9)
         request.ik_request.robot_state = self._seed_robot_state(seed_js)
         future = self.ik_client.call_async(request)
-        self.wait_for_future(future, timeout_sec=3.0)
+        self.wait_for_future(future, timeout_sec=2.0)
         if self._stop_requested:
             raise KeyboardInterrupt
         response = future.result()
@@ -396,27 +407,49 @@ class SPathFollower(Node):
         self._last_ik_code = MOVEIT_SUCCESS
         return response.solution.joint_state
 
-    def compute_ik_with_retries(self, xyz, orientation, seed_js=None, attempts=8):
-        """IK with current seed, then noisy joint seeds if KDL needs a kick."""
-        seeds = [seed_js]
-        base = seed_js if seed_js is not None else self._last_joint_state
-        if base is not None:
-            for _ in range(max(0, attempts - 1)):
-                noisy = JointState()
-                noisy.name = list(base.name)
-                noisy.position = []
-                for name, pos in zip(base.name, base.position):
-                    jitter = random.uniform(-0.45, 0.45) if name in ARM_JOINTS else 0.0
-                    noisy.position.append(pos + jitter)
-                seeds.append(noisy)
-        for seed in seeds:
-            js = self.compute_ik(xyz, orientation, seed_js=seed, set_link_name=True)
-            if js is not None:
-                return js
-            js = self.compute_ik(xyz, orientation, seed_js=seed, set_link_name=False)
-            if js is not None:
-                return js
+    def compute_ik_with_retries(self, xyz, orientation, seed_js=None, attempts=3):
+        """IK with a scene diff seed; skip noisy bombs that used to explode the robot state."""
+        frames = [self.base_frame, "world"]
+        for frame in frames:
+            for set_link in (True, False):
+                js = self.compute_ik(
+                    xyz, orientation, seed_js=seed_js, set_link_name=set_link, frame_id=frame
+                )
+                if js is not None:
+                    return js
         return None
+
+    def probe_ik_at_current_tip(self, tip):
+        """IK to the pose we already have. If this fails, the solver/request is broken."""
+        xyz = xyz_of(tip)
+        q = tip.orientation
+        self.get_logger().info(
+            "IK probe at current tip xyz=({:.3f},{:.3f},{:.3f}) quat=({:.3f},{:.3f},{:.3f},{:.3f})".format(
+                xyz[0], xyz[1], xyz[2], q.x, q.y, q.z, q.w
+            )
+        )
+        js = self.compute_ik_with_retries(xyz, q, seed_js=None, attempts=1)
+        if js is not None:
+            self.get_logger().info("IK probe OK — solver is alive.")
+            return True
+        self.get_logger().error(
+            "IK probe FAILED code={}. KDL never solved the pose the arm is already in. "
+            "Check install kinematics.yaml for duco_arm and that RViz can Plan.".format(
+                getattr(self, "_last_ik_code", "?")
+            )
+        )
+        return False
+
+    def cartesian_nudge(self, xyz, orientation):
+        """One Cartesian waypoint from the current state. Return a RobotTrajectory or None."""
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = xyz
+        pose.orientation = orientation
+        response = self.compute_cartesian_path([pose])
+        self._last_ik_code = response.error_code.val
+        if response.fraction < 0.95:
+            return None
+        return response.solution
 
     def execute_joint_positions(self, names, positions, duration_sec):
         """Send a 2-point joint-space move from the current arm state to positions."""
@@ -514,7 +547,7 @@ class SPathFollower(Node):
         return result_future.result().result
 
     def walk_ik_to(self, target_xyz, orientation, step_m=0.07):
-        """Seeded IK along a straight line in tip space. Return True if the tip arrives."""
+        """Walk the tip in small steps: IK if it works, else a short Cartesian nudge."""
         tip = self.lookup_current_tip_pose()
         start = xyz_of(tip)
         gap = dist3(start, target_xyz)
@@ -527,23 +560,45 @@ class SPathFollower(Node):
         names = ARM_JOINTS
         for i in range(1, steps + 1):
             xyz = lerp3(start, target_xyz, i / float(steps))
-            js = self.compute_ik_with_retries(xyz, orientation, seed_js=seed, attempts=6)
-            if js is None:
+            js = self.compute_ik_with_retries(xyz, orientation, seed_js=seed, attempts=1)
+            if js is not None:
+                names, pos = self._arm_joints_from(js)
+                path.append(pos)
+                seed = js
+                continue
+            if path:
+                duration = max(2.0, min(12.0, len(path) * 0.35))
+                self.execute_joint_path(names, path, duration)
+                path = []
+            cart = self.cartesian_nudge(xyz, orientation)
+            if cart is None:
                 self.get_logger().warn(
-                    "IK walk died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={}".format(
+                    "IK+Cartesian died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={}".format(
                         i, steps, xyz[0], xyz[1], xyz[2], getattr(self, "_last_ik_code", "?")
                     )
                 )
                 return False
-            names, pos = self._arm_joints_from(js)
-            path.append(pos)
-            seed = js
-        duration = max(4.0, min(18.0, steps * 0.45))
-        self.execute_joint_path(names, path, duration)
+            self.get_logger().info("Cartesian nudge step {}/{}".format(i, steps))
+            saved = self.duration_sec
+            self.duration_sec = 1.2
+            try:
+                self.execute_on_arm_controller(cart)
+            finally:
+                self.duration_sec = saved
+            seed = self._last_joint_state
+        if path:
+            duration = max(4.0, min(18.0, len(path) * 0.45))
+            self.execute_joint_path(names, path, duration)
         return True
 
     def approach_first_corner(self, tip):
-        """Walk seeded IK to the nearest S corner, keeping the current wrist. Return orientation."""
+        """Walk to the nearest S corner, keeping the current wrist. Return orientation."""
+        if not self.probe_ik_at_current_tip(tip):
+            raise RuntimeError(
+                "MoveIt IK cannot solve the CURRENT tip pose. kinematics.yaml in "
+                "install/ is empty or unused — RViz Plan may still work in joint space. "
+                "cat .../install/.../config/kinematics.yaml and rebuild duco_arm_example."
+            )
         corner_i, gap = self.nearest_corner_index(tip)
         xyz = self.corners_world[corner_i]
         self.get_logger().info(
@@ -553,7 +608,6 @@ class SPathFollower(Node):
         )
         orientation = tip.orientation
         if not self.walk_ik_to(xyz, orientation):
-            # High corner first (closer to home Z), then the rest.
             order = sorted(
                 range(len(self.corners_world)),
                 key=lambda i: -self.corners_world[i][2],
@@ -574,8 +628,8 @@ class SPathFollower(Node):
                     break
             if not hit:
                 raise RuntimeError(
-                    "No seeded IK walk to the S pane. Check kinematics.yaml is not "
-                    "empty in install/, then retry. Frame should be base_link."
+                    "No IK/Cartesian walk to the S pane from home. "
+                    "Confirm RViz can Cartesian-plan a tiny move first."
                 )
         ordered = self.corners_world[corner_i:] + self.corners_world[:corner_i]
         spacing = float(self.pose.get("spacing_m", 0.03))
