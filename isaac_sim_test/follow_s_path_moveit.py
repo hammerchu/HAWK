@@ -2,21 +2,23 @@
 """Trace S_path with the GCR16 joint6 tip (gcr16_link6) through MoveIt 2.
 
 Window mesh and path share window_frame.json. Run next to duco_arm_example
-demo.launch.py with Isaac Playing. Ctrl+C cancels and holds the arm.
+demo.launch.py with Isaac Playing. Default: joint-space approach, then Cartesian.
+Ctrl+C cancels and holds the arm.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import signal
 import sys
 from pathlib import Path
 
 import rclpy
 from control_msgs.action import FollowJointTrajectory
-from geometry_msgs.msg import Point, Pose, Quaternion, TransformStamped
-from moveit_msgs.msg import RobotState
-from moveit_msgs.srv import GetCartesianPath
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
+from moveit_msgs.msg import PositionIKRequest, RobotState
+from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -38,6 +40,16 @@ from window_path.cad_frame import (  # noqa: E402
 )
 from window_path.dxf_path import densify_closed, load_s_rectangle_cm  # noqa: E402
 
+ARM_JOINTS = [
+    "gcr16_joint1",
+    "gcr16_joint2",
+    "gcr16_joint3",
+    "gcr16_joint4",
+    "gcr16_joint5",
+    "gcr16_joint6",
+]
+MOVEIT_SUCCESS = 1
+
 
 def load_s_world_waypoints(pose):
     """Build world-frame S waypoints from the live DXF and the shared parent pose."""
@@ -51,6 +63,19 @@ def load_s_world_waypoints(pose):
     )
     spacing = float(pose.get("spacing_m", 0.03))
     return world, densify_closed(world, spacing)
+
+
+def quat_from_rpy(roll, pitch, yaw):
+    """Return a geometry_msgs Quaternion from ROS RPY."""
+    x, y, z, w = rpy_to_quat_xyzw(roll, pitch, yaw)
+    return Quaternion(x=x, y=y, z=z, w=w)
+
+
+def dist3(a, b):
+    """Return Euclidean distance between two xyz triples or Point-like objects."""
+    ax, ay, az = (a.x, a.y, a.z) if hasattr(a, "x") else a
+    bx, by, bz = (b.x, b.y, b.z) if hasattr(b, "x") else b
+    return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2)
 
 
 class SPathFollower(Node):
@@ -69,6 +94,7 @@ class SPathFollower(Node):
         )
         self.declare_parameter("max_step", 0.02)
         self.declare_parameter("duration_sec", 36.0)
+        self.declare_parameter("approach_duration_sec", 14.0)
         self.declare_parameter("avoid_collisions", False)
 
         self.group_name = self.get_parameter("group_name").value
@@ -77,6 +103,7 @@ class SPathFollower(Node):
         self.controller_action = self.get_parameter("controller_action").value
         self.max_step = float(self.get_parameter("max_step").value)
         self.duration_sec = float(self.get_parameter("duration_sec").value)
+        self.approach_duration_sec = float(self.get_parameter("approach_duration_sec").value)
         self.avoid_collisions = bool(self.get_parameter("avoid_collisions").value)
 
         self.pose = pose
@@ -86,12 +113,17 @@ class SPathFollower(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self._static_tf = StaticTransformBroadcaster(self)
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
+        self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
         self.follow_client = ActionClient(self, FollowJointTrajectory, self.controller_action)
         self._goal_handle = None
         self._stop_requested = False
         self._last_joint_state = None
+        self._isaac_joint_state = None
         self._joint_state_sub = self.create_subscription(
             JointState, "/joint_states", self._on_joint_state, 10
+        )
+        self._isaac_js_sub = self.create_subscription(
+            JointState, "/isaac_joint_states", self._on_isaac_joint_state, 10
         )
         self._exec_event_pub = self.create_publisher(String, "/trajectory_execution_event", 10)
         self._marker_pub = self.create_publisher(MarkerArray, "/hawk/s_path", 10)
@@ -121,6 +153,10 @@ class SPathFollower(Node):
         """Cache the latest arm state so a stop can hold the current joints."""
         self._last_joint_state = msg
 
+    def _on_isaac_joint_state(self, msg):
+        """Cache Isaac joint states so we know Play is live."""
+        self._isaac_joint_state = msg
+
     def _on_stop_signal(self, _signum, _frame):
         """Set the stop flag only; cancel runs on the main loop (signal-safe)."""
         self._stop_requested = True
@@ -137,7 +173,7 @@ class SPathFollower(Node):
             cancel_future = self._goal_handle.cancel_goal_async()
             self.wait_for_future(cancel_future, timeout_sec=2.0)
         except Exception as exc:
-            self.get_logger().warn(f"Cancel failed: {exc}")
+            self.get_logger().warn("Cancel failed: {}".format(exc))
         self._goal_handle = None
 
     def publish_moveit_stop(self):
@@ -158,19 +194,10 @@ class SPathFollower(Node):
             self.get_logger().warn("No /joint_states yet; cannot send a hold.")
             return
         if not self.follow_client.wait_for_server(timeout_sec=3.0):
-            self.get_logger().warn(f"{self.controller_action} not up; cannot send a hold.")
+            self.get_logger().warn("{} not up; cannot send a hold.".format(self.controller_action))
             return
-        traj = JointTrajectory()
-        traj.joint_names = list(js.name)
-        point = JointTrajectoryPoint()
-        point.positions = list(js.position)
-        point.time_from_start.sec = 0
-        point.time_from_start.nanosec = int(0.2 * 1e9)
-        traj.points = [point]
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = traj
-        send_future = self.follow_client.send_goal_async(goal)
-        self.wait_for_future(send_future, timeout_sec=3.0)
+        names, positions = self._arm_joints_from(js)
+        self.execute_joint_positions(names, positions, duration_sec=0.3)
 
     def stop_motion_now(self):
         """Cancel any live goal, stop MoveIt execution, and hold the current pose."""
@@ -189,6 +216,36 @@ class SPathFollower(Node):
                 return future
             rclpy.spin_once(self, timeout_sec=0.1)
         return future
+
+    def wait_until_ready(self, timeout_sec=180.0):
+        """Block until MoveIt Cartesian IK and Isaac /isaac_joint_states are live."""
+        self.get_logger().info(
+            "Waiting up to {:.0f}s — PRESS PLAY in Isaac (ROS 2 Bridge on).".format(timeout_sec)
+        )
+        deadline = self.get_clock().now() + Duration(seconds=timeout_sec)
+        last_nudge = 0.0
+        while rclpy.ok() and self.get_clock().now() < deadline and not self._stop_requested:
+            rclpy.spin_once(self, timeout_sec=0.2)
+            cart_ok = self.cartesian_client.service_is_ready()
+            isaac_ok = self._isaac_joint_state is not None
+            js_ok = self._last_joint_state is not None
+            if cart_ok and isaac_ok and js_ok:
+                self.get_logger().info("MoveIt + Isaac Play are live.")
+                return
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - last_nudge > 10.0:
+                last_nudge = now
+                self.get_logger().info(
+                    "still waiting: compute_cartesian_path={} isaac_joint_states={} joint_states={}".format(
+                        cart_ok, isaac_ok, js_ok
+                    )
+                )
+        if self._stop_requested:
+            raise KeyboardInterrupt
+        raise RuntimeError(
+            "Timed out waiting for Isaac Play + MoveIt. "
+            "Play the stage, keep ROS 2 Bridge on, and confirm /isaac_joint_states."
+        )
 
     def lookup_current_tip_pose(self, timeout_sec=5.0):
         """Read the current joint6 tip pose in the robot base frame from TF."""
@@ -211,8 +268,9 @@ class SPathFollower(Node):
         if self._stop_requested:
             raise KeyboardInterrupt
         raise RuntimeError(
-            f"No TF from {self.base_frame} to {self.ee_frame}. "
-            "Is duco_arm_example demo.launch.py up?"
+            "No TF from {} to {}. Is duco_arm_example demo.launch.py up?".format(
+                self.base_frame, self.ee_frame
+            )
         )
 
     def _publish_markers(self):
@@ -249,6 +307,142 @@ class SPathFollower(Node):
             glass.points.append(Point(x=b[0], y=b[1], z=b[2]))
             glass.points.append(Point(x=c[0], y=c[1], z=c[2]))
         self._marker_pub.publish(MarkerArray(markers=[line, glass]))
+
+    def _arm_joints_from(self, js):
+        """Pick gcr16_joint1..6 out of a JointState in controller order."""
+        index = {name: i for i, name in enumerate(js.name)}
+        missing = [name for name in ARM_JOINTS if name not in index]
+        if missing:
+            raise RuntimeError("JointState missing {}".format(missing))
+        return ARM_JOINTS, [js.position[index[name]] for name in ARM_JOINTS]
+
+    def nearest_corner_index(self, tip):
+        """Return the S-corner index closest to the current tip."""
+        best_i = 0
+        best_d = 1e9
+        for i, corner in enumerate(self.corners_world):
+            d = dist3(tip.position, corner)
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i, best_d
+
+    def orientation_candidates(self, current):
+        """Try current wrist, then tool-Z into the glass (-Y), then a few backups."""
+        return [
+            ("current", current.orientation),
+            ("ee_z_neg_y", quat_from_rpy(math.pi / 2.0, 0.0, 0.0)),
+            ("ee_z_pos_y", quat_from_rpy(-math.pi / 2.0, 0.0, 0.0)),
+            ("ee_z_neg_x", quat_from_rpy(0.0, math.pi / 2.0, 0.0)),
+            ("identity", quat_from_rpy(0.0, 0.0, 0.0)),
+        ]
+
+    def compute_ik(self, xyz, orientation):
+        """Call MoveIt GetPositionIK for one pose. Return JointState or None."""
+        if not self.ik_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError("/compute_ik is missing. Is move_group running?")
+        pose = PoseStamped()
+        pose.header.frame_id = self.base_frame
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = xyz
+        pose.pose.orientation = orientation
+        request = GetPositionIK.Request()
+        request.ik_request = PositionIKRequest()
+        request.ik_request.group_name = self.group_name
+        request.ik_request.ik_link_name = self.ee_frame
+        request.ik_request.pose_stamped = pose
+        request.ik_request.avoid_collisions = self.avoid_collisions
+        request.ik_request.timeout.sec = 2
+        request.ik_request.robot_state = RobotState()
+        request.ik_request.robot_state.is_diff = True
+        future = self.ik_client.call_async(request)
+        self.wait_for_future(future, timeout_sec=5.0)
+        if self._stop_requested:
+            raise KeyboardInterrupt
+        response = future.result()
+        if response is None or response.error_code.val != MOVEIT_SUCCESS:
+            return None
+        return response.solution.joint_state
+
+    def execute_joint_positions(self, names, positions, duration_sec):
+        """Send a 2-point joint-space move from the current arm state to positions."""
+        deadline = self.get_clock().now() + Duration(seconds=5.0)
+        while self._last_joint_state is None and rclpy.ok() and self.get_clock().now() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._last_joint_state is None:
+            raise RuntimeError("No /joint_states for the approach move.")
+        if not self.follow_client.wait_for_server(timeout_sec=10.0):
+            raise RuntimeError("{} is missing.".format(self.controller_action))
+        start_names, start_pos = self._arm_joints_from(self._last_joint_state)
+        if list(start_names) != list(names):
+            idx = {n: i for i, n in enumerate(names)}
+            positions = [positions[idx[n]] for n in start_names]
+            names = start_names
+        traj = JointTrajectory()
+        traj.joint_names = list(names)
+        start = JointTrajectoryPoint()
+        start.positions = list(start_pos)
+        start.time_from_start.sec = 0
+        start.time_from_start.nanosec = 0
+        goal = JointTrajectoryPoint()
+        goal.positions = [float(p) for p in positions]
+        t = max(0.2, float(duration_sec))
+        goal.time_from_start.sec = int(t)
+        goal.time_from_start.nanosec = int((t - int(t)) * 1e9)
+        traj.points = [start, goal]
+        action_goal = FollowJointTrajectory.Goal()
+        action_goal.trajectory = traj
+        self.get_logger().info(
+            "Joint approach {} pts over {:.1f}s to {}".format(
+                len(traj.points), t, self.controller_action
+            )
+        )
+        send_future = self.follow_client.send_goal_async(action_goal)
+        self.wait_for_future(send_future, timeout_sec=10.0)
+        if self._stop_requested:
+            raise KeyboardInterrupt
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            raise RuntimeError("Approach FollowJointTrajectory was rejected.")
+        self._goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        self.wait_for_future(result_future, timeout_sec=t + 5.0)
+        if self._stop_requested:
+            self.stop_motion_now()
+            raise KeyboardInterrupt
+        self._goal_handle = None
+        return result_future.result().result
+
+    def approach_first_corner(self, tip):
+        """Joint-space IK to the nearest S corner with a reachable wrist. Return orientation."""
+        corner_i, gap = self.nearest_corner_index(tip)
+        xyz = self.corners_world[corner_i]
+        self.get_logger().info(
+            "Approach corner {} at ({:.3f},{:.3f},{:.3f}), {:.3f}m from tip.".format(
+                corner_i, xyz[0], xyz[1], xyz[2], gap
+            )
+        )
+        last_err = "no IK"
+        for name, orientation in self.orientation_candidates(tip):
+            js = self.compute_ik(xyz, orientation)
+            if js is None:
+                self.get_logger().info("IK miss with orientation {}".format(name))
+                continue
+            try:
+                names, positions = self._arm_joints_from(js)
+            except RuntimeError as exc:
+                last_err = str(exc)
+                continue
+            self.get_logger().info("IK hit with {} — moving in joint space.".format(name))
+            self.execute_joint_positions(names, positions, self.approach_duration_sec)
+            ordered = self.corners_world[corner_i:] + self.corners_world[:corner_i]
+            spacing = float(self.pose.get("spacing_m", 0.03))
+            self.waypoints_world = densify_closed(ordered, spacing)
+            return orientation
+        raise RuntimeError(
+            "No IK to the S pane from home ({}) . Edit window_frame.json translation_m.".format(
+                last_err
+            )
+        )
 
     def sample_path_waypoints(self, tip_orientation: Quaternion):
         """Stamp S world positions with a fixed joint6 orientation."""
@@ -313,14 +507,15 @@ class SPathFollower(Node):
         )
         if not self.follow_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(
-                f"{self.controller_action} is missing. Is duco_arm_controller spawned?"
+                "{} is missing. Is duco_arm_controller spawned?".format(self.controller_action)
             )
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = joint_traj
         self.get_logger().info(
-            f"Sending {len(joint_traj.points)} pts over {self.duration_sec:.1f}s "
-            f"to {self.controller_action}"
+            "Sending {} pts over {:.1f}s to {}".format(
+                len(joint_traj.points), self.duration_sec, self.controller_action
+            )
         )
         send_future = self.follow_client.send_goal_async(goal)
         self.wait_for_future(send_future, timeout_sec=10.0)
@@ -341,10 +536,15 @@ class SPathFollower(Node):
 
 
 def main():
-    """Preview the aligned S loop, or plan it and execute on the GCR tip."""
+    """Wait for Isaac Play, approach the S pane, then Cartesian-trace it."""
     parser = argparse.ArgumentParser(description="GCR joint6 tip follows S_path.")
     parser.add_argument("--stop", action="store_true", help="Halt leftover motion only.")
     parser.add_argument("--preview", action="store_true", help="Publish RViz markers, no motion.")
+    parser.add_argument(
+        "--no-approach",
+        action="store_true",
+        help="Skip joint-space IK to the pane (old behavior: Cartesian from here).",
+    )
     parser.add_argument("--pose", default="", help="Override window_frame.json")
     args, ros_args = parser.parse_known_args()
 
@@ -391,25 +591,37 @@ def main():
 
     node.get_logger().info("Foreground — Ctrl+C stops the script and the arm.")
     try:
+        node.wait_until_ready()
         tip = node.lookup_current_tip_pose()
         node.get_logger().info(
-            f"Tip {node.ee_frame} in {node.base_frame}: "
-            f"x={tip.position.x:.3f} y={tip.position.y:.3f} z={tip.position.z:.3f} "
-            "(orientation kept for the whole S loop — jog the wrist to face the glass first)"
+            "Tip {} in {}: x={:.3f} y={:.3f} z={:.3f}".format(
+                node.ee_frame,
+                node.base_frame,
+                tip.position.x,
+                tip.position.y,
+                tip.position.z,
+            )
         )
-        waypoints = node.sample_path_waypoints(tip.orientation)
+        if args.no_approach:
+            orientation = tip.orientation
+            node.get_logger().info("No approach — Cartesian from the current pose.")
+        else:
+            orientation = node.approach_first_corner(tip)
+        waypoints = node.sample_path_waypoints(orientation)
         cartesian = node.compute_cartesian_path(waypoints)
         node.get_logger().info(
-            f"Cartesian fraction={cartesian.fraction:.2f} error={cartesian.error_code.val}"
+            "Cartesian fraction={:.2f} error={}".format(
+                cartesian.fraction, cartesian.error_code.val
+            )
         )
         if cartesian.fraction < 0.99:
             node.get_logger().error(
-                "MoveIt could not cover the whole S loop. Jog closer, or edit "
+                "MoveIt could not cover the whole S loop. Edit "
                 "window_path/window_frame.json translation_m and re-run."
             )
             return
         result = node.execute_on_arm_controller(cartesian.solution)
-        node.get_logger().info(f"FollowJointTrajectory error_code={result.error_code}")
+        node.get_logger().info("FollowJointTrajectory error_code={}".format(result.error_code))
     except KeyboardInterrupt:
         node.stop_motion_now()
         node.get_logger().info("Stopped by Ctrl+C.")
