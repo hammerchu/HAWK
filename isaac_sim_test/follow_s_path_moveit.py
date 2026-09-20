@@ -353,10 +353,19 @@ def main():
     node = SPathFollower(pose)
     cmin = [min(p[i] for p in node.corners_world) for i in range(3)]
     cmax = [max(p[i] for p in node.corners_world) for i in range(3)]
+    # Humble's Python 3.10 chokes on f"{list[i]:.3f}" inside literal [].
     node.get_logger().info(
-        f"S world x[{cmin[0]:.3f},{cmax[0]:.3f}] "
-        f"y[{cmin[1]:.3f},{cmax[1]:.3f}] z[{cmin[2]:.3f},{cmax[2]:.3f]} "
-        f"n={len(node.waypoints_world)} ee={node.ee_frame} group={node.group_name}"
+        "S world x[{:.3f},{:.3f}] y[{:.3f},{:.3f}] z[{:.3f},{:.3f}] n={} ee={} group={}".format(
+            cmin[0],
+            cmax[0],
+            cmin[1],
+            cmax[1],
+            cmin[2],
+            cmax[2],
+            len(node.waypoints_world),
+            node.ee_frame,
+            node.group_name,
+        )
     )
     node.get_logger().info("RViz: add MarkerArray /hawk/s_path. Green loop must sit on the pane.")
 
