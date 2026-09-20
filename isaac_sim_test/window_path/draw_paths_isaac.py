@@ -3,18 +3,26 @@
 Run this *inside* Isaac (Window → Script Editor → Open this file → Run).
 ROS python3 cannot import isaacsim.util.debug_draw.
 
-Use draw_lines (straight segments), not draw_lines_spline — a spline through
-four corners becomes an oval. Re-run to refresh; the script clears old lines.
+Polylines use draw_lines (not spline). Dots are waypoints; V chevrons show
+travel direction; the white dot is the loop start. Re-run to refresh.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 S_COLOR = (0.15, 0.95, 0.35, 1.0)
 L_COLOR = (0.95, 0.75, 0.15, 1.0)
+START_COLOR = (1.0, 1.0, 1.0, 1.0)
 LINE_WIDTH = 5.0
+ARROW_WIDTH = 3.0
+ARROW_LEN = 0.08
+WAYPOINT_SPACING = 0.12
+CORNER_PT_SIZE = 16.0
+WP_PT_SIZE = 8.0
+START_PT_SIZE = 22.0
 WINDOW_PRIM_PATHS = ("/window_frame", "/World/window_frame")
 
 
@@ -55,6 +63,91 @@ def _draw_polyline(draw, points, color, width):
     colors = [color] * len(starts)
     widths = [float(width)] * len(starts)
     draw.draw_lines(starts, ends, colors, widths)
+
+
+def _vsub(a, b):
+    """Return vector a - b."""
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vadd(a, b):
+    """Return vector a + b."""
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _vmul(a, s):
+    """Return vector a scaled by s."""
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _vlen(a):
+    """Return Euclidean length of a 3-vector."""
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _vnorm(a):
+    """Return a unit vector, or (1, 0, 0) if a is degenerate."""
+    n = _vlen(a)
+    if n < 1e-9:
+        return (1.0, 0.0, 0.0)
+    return (a[0] / n, a[1] / n, a[2] / n)
+
+
+def _in_plane_perp(direction):
+    """Return a unit perpendicular in the path plane (prefer world-Z cross)."""
+    dx, dy, dz = direction
+    perp = (-dy, dx, 0.0)
+    if _vlen(perp) < 1e-9:
+        perp = (-dz, 0.0, dx)
+    return _vnorm(perp)
+
+
+def _edge_waypoints(closed_pts, spacing):
+    """Sample points along each edge, skipping the duplicated closing vertex."""
+    samples = []
+    for start, end in zip(closed_pts[:-1], closed_pts[1:]):
+        delta = _vsub(end, start)
+        length = _vlen(delta)
+        count = max(1, int(math.floor(length / spacing)))
+        for i in range(count):
+            t = i / float(count)
+            samples.append(_vadd(start, _vmul(delta, t)))
+    return samples
+
+
+def _arrow_segments(start, end, size):
+    """Return (starts, ends) for a V chevron pointing start → end, near 72% of the edge."""
+    delta = _vsub(end, start)
+    length = _vlen(delta)
+    if length < size * 2.0:
+        return [], []
+    direction = _vnorm(delta)
+    tip = _vadd(start, _vmul(delta, 0.72))
+    back = _vadd(tip, _vmul(direction, -size))
+    side = _vmul(_in_plane_perp(direction), size * 0.45)
+    left = _vadd(back, side)
+    right = _vsub(back, side)
+    return [tip, tip, tip], [left, right, back]
+
+
+def _draw_waypoints_and_arrows(draw, closed_pts, color):
+    """Draw edge samples, a bigger start dot, and direction chevrons on each side."""
+    corners = closed_pts[:-1]
+    samples = _edge_waypoints(closed_pts, WAYPOINT_SPACING)
+    if hasattr(draw, "draw_points") and samples:
+        draw.draw_points(samples, [color] * len(samples), [WP_PT_SIZE] * len(samples))
+        draw.draw_points(corners, [color] * len(corners), [CORNER_PT_SIZE] * len(corners))
+        draw.draw_points([closed_pts[0]], [START_COLOR], [START_PT_SIZE])
+    arrow_starts = []
+    arrow_ends = []
+    for start, end in zip(closed_pts[:-1], closed_pts[1:]):
+        heads, tails = _arrow_segments(start, end, ARROW_LEN)
+        arrow_starts.extend(heads)
+        arrow_ends.extend(tails)
+    if arrow_starts:
+        colors = [color] * len(arrow_starts)
+        widths = [ARROW_WIDTH] * len(arrow_starts)
+        draw.draw_lines(arrow_starts, arrow_ends, colors, widths)
 
 
 def _find_window_prim(stage):
@@ -117,6 +210,8 @@ def draw_s_l_paths():
     """Clear previous strokes and draw S (green) plus L (gold) in the viewport."""
     draw = _acquire_draw()
     draw.clear_lines()
+    if hasattr(draw, "clear_points"):
+        draw.clear_points()
 
     generated = _generated_dir()
     window_prim = None
@@ -133,6 +228,8 @@ def draw_s_l_paths():
     l_pts = _points_for_path(_load_path_json(generated, "L"), window_prim)
     _draw_polyline(draw, s_pts, S_COLOR, LINE_WIDTH)
     _draw_polyline(draw, l_pts, L_COLOR, LINE_WIDTH)
+    _draw_waypoints_and_arrows(draw, s_pts, S_COLOR)
+    _draw_waypoints_and_arrows(draw, l_pts, L_COLOR)
 
     source = "live /window_frame xform" if window_prim else "JSON world corners"
     print("Drew S (green, {} pts) and L (gold, {} pts) from {}.".format(
