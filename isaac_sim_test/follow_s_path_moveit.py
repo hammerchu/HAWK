@@ -20,6 +20,7 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, TransformStamped
 from moveit_msgs.msg import PositionIKRequest, RobotState
 from moveit_msgs.srv import GetCartesianPath, GetPositionIK
+from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -131,6 +132,7 @@ class SPathFollower(Node):
         self._static_tf = StaticTransformBroadcaster(self)
         self.cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.ik_client = self.create_client(GetPositionIK, "/compute_ik")
+        self._param_client = self.create_client(GetParameters, "/move_group/get_parameters")
         self.follow_client = ActionClient(self, FollowJointTrajectory, self.controller_action)
         self._goal_handle = None
         self._stop_requested = False
@@ -248,6 +250,7 @@ class SPathFollower(Node):
             js_ok = self._last_joint_state is not None
             if cart_ok and isaac_ok and js_ok:
                 self.get_logger().info("MoveIt + Isaac Play are live.")
+                self.log_move_group_kinematics()
                 return
             now = self.get_clock().now().nanoseconds / 1e9
             if now - last_nudge > 10.0:
@@ -263,6 +266,34 @@ class SPathFollower(Node):
             "Timed out waiting for Isaac Play + MoveIt. "
             "Play the stage, keep ROS 2 Bridge on, and confirm /isaac_joint_states."
         )
+
+    def log_move_group_kinematics(self):
+        """Print the live KDL plugin string from /move_group (null = launch never loaded yaml)."""
+        name = "robot_description_kinematics.{}.kinematics_solver".format(self.group_name)
+        if not self._param_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("No /move_group/get_parameters — cannot read kinematics_solver.")
+            return
+        req = GetParameters.Request()
+        req.names = [name]
+        future = self._param_client.call_async(req)
+        self.wait_for_future(future, timeout_sec=2.0)
+        result = future.result()
+        if result is None or not result.values:
+            self.get_logger().warn("kinematics_solver param missing: {}".format(name))
+            return
+        val = result.values[0]
+        text = val.string_value if val.string_value else str(val)
+        self.get_logger().info("live kinematics_solver={}".format(text))
+
+    def probe_cartesian_here(self, tip):
+        """Ask GetCartesianPath for the pose we already have. True if fraction is ~1."""
+        response = self.compute_cartesian_path([tip])
+        self.get_logger().info(
+            "Cartesian probe fraction={:.2f} error={}".format(
+                response.fraction, response.error_code.val
+            )
+        )
+        return response.fraction >= 0.99
 
     def lookup_current_tip_pose(self, timeout_sec=5.0):
         """Read the current joint6 tip pose in the robot base frame from TF."""
@@ -390,8 +421,8 @@ class SPathFollower(Node):
             request.ik_request.ik_link_name = self.ee_frame
         request.ik_request.pose_stamped = pose
         request.ik_request.avoid_collisions = False
-        request.ik_request.timeout.sec = 0
-        request.ik_request.timeout.nanosec = int(0.2 * 1e9)
+        request.ik_request.timeout.sec = 1
+        request.ik_request.timeout.nanosec = 0
         request.ik_request.robot_state = self._seed_robot_state(seed_js)
         future = self.ik_client.call_async(request)
         self.wait_for_future(future, timeout_sec=2.0)
@@ -593,11 +624,18 @@ class SPathFollower(Node):
 
     def approach_first_corner(self, tip):
         """Walk to the nearest S corner, keeping the current wrist. Return orientation."""
-        if not self.probe_ik_at_current_tip(tip):
+        ik_ok = self.probe_ik_at_current_tip(tip)
+        cart_ok = self.probe_cartesian_here(tip)
+        if not ik_ok and not cart_ok:
             raise RuntimeError(
-                "MoveIt IK cannot solve the CURRENT tip pose. kinematics.yaml in "
-                "install/ is empty or unused — RViz Plan may still work in joint space. "
-                "cat .../install/.../config/kinematics.yaml and rebuild duco_arm_example."
+                "Both /compute_ik and /compute_cartesian_path failed at the current tip. "
+                "Look for live kinematics_solver= above — it must be "
+                "kdl_kinematics_plugin/KDLKinematicsPlugin, not empty/null. "
+                "Restart MoveIt after sourcing install/setup.bash."
+            )
+        if not ik_ok:
+            self.get_logger().warn(
+                "GetPositionIK is dead; approach will use Cartesian nudges only."
             )
         corner_i, gap = self.nearest_corner_index(tip)
         xyz = self.corners_world[corner_i]
