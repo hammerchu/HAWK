@@ -113,6 +113,50 @@ def lerp3(a, b, t):
     return (ax + (bx - ax) * t, ay + (by - ay) * t, az + (bz - az) * t)
 
 
+def _transpose(rows):
+    """Return the transpose of a row-major matrix."""
+    return [list(col) for col in zip(*rows)]
+
+
+def _mat_vec(rows, vec):
+    """Return matrix-vector product for a row-major matrix."""
+    return [sum(row[j] * vec[j] for j in range(len(vec))) for row in rows]
+
+
+def _mat_mul(a, b):
+    """Return A @ B for row-major matrices."""
+    bt = _transpose(b)
+    return [[sum(x * y for x, y in zip(row, col)) for col in bt] for row in a]
+
+
+def _inv3(m):
+    """Return the inverse of a 3x3 row-major matrix."""
+    a, b, c = m[0]
+    d, e, f = m[1]
+    g, h, i = m[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) < 1e-12:
+        raise ZeroDivisionError("singular 3x3")
+    s = 1.0 / det
+    return [
+        [(e * i - f * h) * s, (c * h - b * i) * s, (b * f - c * e) * s],
+        [(f * g - d * i) * s, (a * i - c * g) * s, (c * d - a * f) * s],
+        [(d * h - e * g) * s, (b * g - a * h) * s, (a * e - b * d) * s],
+    ]
+
+
+def _dls_position(jacobian, err, lam=0.08):
+    """Damped least-squares joint step for a 3x6 positional Jacobian."""
+    jjt = _mat_mul(jacobian, _transpose(jacobian))
+    for k in range(3):
+        jjt[k][k] += lam * lam
+    try:
+        ainv = _inv3(jjt)
+    except ZeroDivisionError:
+        return [0.0] * 6
+    return _mat_vec(_transpose(jacobian), _mat_vec(ainv, err))
+
+
 class SPathFollower(Node):
     """IK the S rectangle with MoveIt, then stream it to duco_arm_controller."""
 
@@ -552,15 +596,91 @@ class SPathFollower(Node):
         return response.solution.joint_state
 
     def compute_ik_with_retries(self, xyz, orientation, seed_js=None, attempts=3):
-        """IK in the planning frame with the group tip link. Retries keep a stable request."""
+        """Try KDL once, then FK-based numerical IK. KDL is loaded but cannot solve this GCR."""
         del attempts
-        for set_link in (True, False):
-            js = self.compute_ik(
-                xyz, orientation, seed_js=seed_js, set_link_name=set_link
+        js = self.compute_ik(xyz, orientation, seed_js=seed_js, set_link_name=True)
+        if js is not None:
+            return js
+        return self.numerical_ik_position(xyz, seed_js=seed_js)
+
+    def _positions_to_js(self, positions):
+        """Build a 6-joint JointState from gcr16_joint1..6 values."""
+        js = JointState()
+        js.name = list(ARM_JOINTS)
+        js.position = [float(p) for p in positions]
+        return js
+
+    def _fk_xyz(self, positions):
+        """Return gcr16_link6 xyz in the planning frame for a joint vector."""
+        stamped = self.compute_fk(self.ee_frame, self._positions_to_js(positions))
+        if stamped is None:
+            raise RuntimeError("GetPositionFK failed during numerical IK")
+        return xyz_of(stamped.pose)
+
+    def _seed_positions(self, seed_js=None):
+        """Return current gcr16_joint1..6 positions from a seed or live JointState."""
+        seed = seed_js if seed_js is not None else (
+            self._last_joint_state or self._isaac_joint_state
+        )
+        if seed is None:
+            raise RuntimeError("No joint seed for numerical IK")
+        _, pos = self._arm_joints_from(seed)
+        return list(pos)
+
+    def numerical_ik_position(self, target_xyz, seed_js=None, pos_tol=0.008, max_iter=80):
+        """Solve XYZ with MoveIt FK + damped least squares. Does not use KDL."""
+        q = self._seed_positions(seed_js)
+        last_dist = 1e9
+        for it in range(max_iter):
+            if self._stop_requested:
+                raise KeyboardInterrupt
+            p0 = self._fk_xyz(q)
+            err = [target_xyz[i] - p0[i] for i in range(3)]
+            last_dist = math.sqrt(sum(e * e for e in err))
+            if last_dist <= pos_tol:
+                self._last_ik_code = MOVEIT_SUCCESS
+                return self._positions_to_js(q)
+            scale = 0.08 / last_dist if last_dist > 0.08 else 1.0
+            step_err = [e * scale for e in err]
+            jac = []
+            eps = 1e-4
+            for j in range(6):
+                q2 = list(q)
+                q2[j] += eps
+                p1 = self._fk_xyz(q2)
+                jac.append([(p1[r] - p0[r]) / eps for r in range(3)])
+            jacobian = _transpose(jac)
+            dq = _dls_position(jacobian, step_err)
+            mag = max(abs(v) for v in dq) or 1.0
+            if mag > 0.2:
+                dq = [v * 0.2 / mag for v in dq]
+            q = [qj + dqj for qj, dqj in zip(q, dq)]
+        self.get_logger().warn(
+            "FK-IK missed target dist={:.3f}m xyz=({:.3f},{:.3f},{:.3f})".format(
+                last_dist, target_xyz[0], target_xyz[1], target_xyz[2]
             )
-            if js is not None:
-                return js
+        )
         return None
+
+    def execute_xyz_path_fk_ik(self, xyzs, duration_sec):
+        """Trace world xyz waypoints with numerical IK and stream the joint path."""
+        seed = self._last_joint_state or self._isaac_joint_state
+        path = []
+        names = ARM_JOINTS
+        count = len(xyzs)
+        for i, xyz in enumerate(xyzs):
+            js = self.numerical_ik_position(xyz, seed_js=seed)
+            if js is None:
+                self.get_logger().error("FK-IK died at waypoint {}/{}".format(i + 1, count))
+                return False
+            names, pos = self._arm_joints_from(js)
+            path.append(pos)
+            seed = js
+            if i == 0 or (i + 1) % 20 == 0 or i + 1 == count:
+                self.get_logger().info("FK-IK path {}/{}".format(i + 1, count))
+        duration = max(float(duration_sec), len(path) * 0.12)
+        self.execute_joint_path(names, path, duration)
+        return True
 
     def probe_ik_at_current_tip(self, tip):
         """IK to MoveIt's FK pose. Failure at all-zero stretch is a KDL singularity, not a dead plugin."""
@@ -595,8 +715,7 @@ class SPathFollower(Node):
                 self.get_logger().warn(str(exc))
         code = getattr(self, "_last_ik_code", None)
         self.get_logger().warn(
-            "IK probe FAILED code={} ({}). Stretched all-zero is a KDL singularity; "
-            "will joint-space jog off the pole if needed.".format(
+            "KDL IK probe FAILED code={} ({}). Using FK numerical IK instead.".format(
                 code, moveit_error_name(code)
             )
         )
@@ -736,55 +855,19 @@ class SPathFollower(Node):
         return result_future.result().result
 
     def walk_ik_to(self, target_xyz, orientation, step_m=0.07):
-        """Walk the tip in small steps: IK if it works, else a short Cartesian nudge."""
+        """Joint-space move to a Cartesian target using FK numerical IK (KDL cannot solve this GCR)."""
+        del orientation, step_m
         tip = self.lookup_tip_in_planning_frame()
-        start = xyz_of(tip)
-        gap = dist3(start, target_xyz)
-        steps = max(1, int(math.ceil(gap / step_m)))
-        self.get_logger().info(
-            "IK walk {} steps, {:.3f}m, keep current wrist.".format(steps, gap)
-        )
-        seed = self._last_joint_state
-        path = []
-        names = ARM_JOINTS
-        for i in range(1, steps + 1):
-            xyz = lerp3(start, target_xyz, i / float(steps))
-            js = self.compute_ik_with_retries(xyz, orientation, seed_js=seed, attempts=1)
-            if js is not None:
-                names, pos = self._arm_joints_from(js)
-                path.append(pos)
-                seed = js
-                continue
-            if path:
-                duration = max(2.0, min(12.0, len(path) * 0.35))
-                self.execute_joint_path(names, path, duration)
-                path = []
-            cart = self.cartesian_nudge(xyz, orientation)
-            if cart is None:
-                code = getattr(self, "_last_ik_code", None)
-                self.get_logger().warn(
-                    "IK+Cartesian died at step {}/{} xyz=({:.3f},{:.3f},{:.3f}) code={} ({})".format(
-                        i,
-                        steps,
-                        xyz[0],
-                        xyz[1],
-                        xyz[2],
-                        code,
-                        moveit_error_name(code),
-                    )
-                )
-                return False
-            self.get_logger().info("Cartesian nudge step {}/{}".format(i, steps))
-            saved = self.duration_sec
-            self.duration_sec = 1.2
-            try:
-                self.execute_on_arm_controller(cart)
-            finally:
-                self.duration_sec = saved
-            seed = self._last_joint_state
-        if path:
-            duration = max(4.0, min(18.0, len(path) * 0.45))
-            self.execute_joint_path(names, path, duration)
+        gap = dist3(xyz_of(tip), target_xyz)
+        self.get_logger().info("FK-IK approach {:.3f}m to ({:.3f},{:.3f},{:.3f}).".format(
+            gap, target_xyz[0], target_xyz[1], target_xyz[2]
+        ))
+        js = self.numerical_ik_position(target_xyz)
+        if js is None:
+            return False
+        names, pos = self._arm_joints_from(js)
+        duration = max(self.approach_duration_sec, min(24.0, gap * 6.0))
+        self.execute_joint_positions(names, pos, duration)
         return True
 
     def approach_first_corner(self, tip):
@@ -801,7 +884,7 @@ class SPathFollower(Node):
             cart_ok = self.probe_cartesian_here(tip)
         if not ik_ok and not cart_ok:
             self.get_logger().warn(
-                "Probes still failing after jog; trying the IK walk anyway."
+                "KDL probes failed; approach will use FK numerical IK."
             )
         elif not ik_ok:
             self.get_logger().warn(
@@ -1016,10 +1099,15 @@ def main():
             )
         )
         if cartesian.fraction < 0.99:
-            node.get_logger().error(
-                "MoveIt could not cover the whole S loop. Edit "
-                "window_path/window_frame.json translation_m and re-run."
+            node.get_logger().warn(
+                "KDL Cartesian fraction={:.2f}; tracing S with FK numerical IK.".format(
+                    cartesian.fraction
+                )
             )
+            if not node.execute_xyz_path_fk_ik(node.waypoints_world, node.duration_sec):
+                node.get_logger().error("FK numerical IK could not cover the S loop.")
+                return
+            node.get_logger().info("S loop sent via FK numerical IK.")
             return
         result = node.execute_on_arm_controller(cartesian.solution)
         node.get_logger().info("FollowJointTrajectory error_code={}".format(result.error_code))
