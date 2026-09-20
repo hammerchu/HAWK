@@ -1,10 +1,10 @@
-"""Draw S (green) and L (gold) loops in the Isaac Sim viewport via debug_draw.
+"""Draw S (green) and L (gold) rectangles in the Isaac Sim viewport via debug_draw.
 
 Run this *inside* Isaac (Window → Script Editor → Open this file → Run).
 ROS python3 cannot import isaacsim.util.debug_draw.
 
-The last draw_lines_spline bool is dashed, not closed — we append the first
-point so the rectangle seals. Re-run to refresh; the script clears old lines.
+Use draw_lines (straight segments), not draw_lines_spline — a spline through
+four corners becomes an oval. Re-run to refresh; the script clears old lines.
 """
 
 from __future__ import annotations
@@ -46,6 +46,15 @@ def _as_xyz(points):
     if xyz[0] != xyz[-1]:
         xyz.append(xyz[0])
     return xyz
+
+
+def _draw_polyline(draw, points, color, width):
+    """Stroke a closed polyline as straight segments (DXF LWPOLYLINE, not a spline)."""
+    starts = points[:-1]
+    ends = points[1:]
+    colors = [color] * len(starts)
+    widths = [float(width)] * len(starts)
+    draw.draw_lines(starts, ends, colors, widths)
 
 
 def _find_window_prim(stage):
@@ -122,9 +131,8 @@ def draw_s_l_paths():
 
     s_pts = _points_for_path(_load_path_json(generated, "S"), window_prim)
     l_pts = _points_for_path(_load_path_json(generated, "L"), window_prim)
-    # 4th arg is dashed (NVIDIA docs), not closed — loop is sealed by repeating pt0.
-    draw.draw_lines_spline(s_pts, S_COLOR, LINE_WIDTH, False)
-    draw.draw_lines_spline(l_pts, L_COLOR, LINE_WIDTH, False)
+    _draw_polyline(draw, s_pts, S_COLOR, LINE_WIDTH)
+    _draw_polyline(draw, l_pts, L_COLOR, LINE_WIDTH)
 
     source = "live /window_frame xform" if window_prim else "JSON world corners"
     print("Drew S (green, {} pts) and L (gold, {} pts) from {}.".format(
