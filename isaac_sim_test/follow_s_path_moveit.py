@@ -168,6 +168,10 @@ class SPathFollower(Node):
         msg.transform.rotation.w = qw
         self._static_tf.sendTransform(msg)
 
+    def _joint_state_is_ready(self, js):
+        """True when a JointState actually contains the GCR arm joints."""
+        return js is not None and "gcr16_joint1" in js.name
+
     def _on_joint_state(self, msg):
         """Cache the latest arm state so a stop can hold the current joints."""
         self._last_joint_state = msg
@@ -246,8 +250,8 @@ class SPathFollower(Node):
         while rclpy.ok() and self.get_clock().now() < deadline and not self._stop_requested:
             rclpy.spin_once(self, timeout_sec=0.2)
             cart_ok = self.cartesian_client.service_is_ready()
-            isaac_ok = self._isaac_joint_state is not None
-            js_ok = self._last_joint_state is not None
+            isaac_ok = self._joint_state_is_ready(self._isaac_joint_state)
+            js_ok = self._joint_state_is_ready(self._last_joint_state)
             if cart_ok and isaac_ok and js_ok:
                 self.get_logger().info("MoveIt + Isaac Play are live.")
                 self.log_move_group_kinematics()
@@ -388,9 +392,22 @@ class SPathFollower(Node):
         """Keep only gcr16_joint1..6 so a seed cannot wipe the rest of the robot."""
         names, positions = self._arm_joints_from(joint_state)
         slim = JointState()
+        slim.header.stamp = self.get_clock().now().to_msg()
+        slim.header.frame_id = self.base_frame
         slim.name = list(names)
         slim.position = [float(p) for p in positions]
         return slim
+
+    def _fresh_start_state(self):
+        """RobotState MoveIt will accept (stamped joints). Empty is_diff hits ROBOT_STATE_STALE."""
+        state = RobotState()
+        seed = self._last_joint_state or self._isaac_joint_state
+        if seed is None:
+            state.is_diff = True
+            return state
+        state.is_diff = False
+        state.joint_state = self._arm_only_js(seed)
+        return state
 
     def _seed_robot_state(self, joint_state=None):
         """Diff-seed MoveIt with the 6 arm joints. A full is_diff=False state breaks KDL."""
@@ -423,7 +440,9 @@ class SPathFollower(Node):
         request.ik_request.avoid_collisions = False
         request.ik_request.timeout.sec = 1
         request.ik_request.timeout.nanosec = 0
-        request.ik_request.robot_state = self._seed_robot_state(seed_js)
+        request.ik_request.robot_state = (
+            self._fresh_start_state() if seed_js is None else self._seed_robot_state(seed_js)
+        )
         future = self.ik_client.call_async(request)
         self.wait_for_future(future, timeout_sec=2.0)
         if self._stop_requested:
@@ -463,6 +482,17 @@ class SPathFollower(Node):
         if js is not None:
             self.get_logger().info("IK probe OK — solver is alive.")
             return True
+        seed = self._last_joint_state or self._isaac_joint_state
+        if seed is not None:
+            try:
+                names, pos = self._arm_joints_from(seed)
+                self.get_logger().info(
+                    "seed joints {} = {}".format(
+                        names, ["{:.3f}".format(p) for p in pos]
+                    )
+                )
+            except RuntimeError as exc:
+                self.get_logger().warn(str(exc))
         self.get_logger().error(
             "IK probe FAILED code={}. KDL never solved the pose the arm is already in. "
             "Check install kinematics.yaml for duco_arm and that RViz can Plan.".format(
@@ -694,8 +724,7 @@ class SPathFollower(Node):
         request = GetCartesianPath.Request()
         request.header.frame_id = self.base_frame
         request.header.stamp = self.get_clock().now().to_msg()
-        request.start_state = RobotState()
-        request.start_state.is_diff = True
+        request.start_state = self._fresh_start_state()
         request.group_name = self.group_name
         request.link_name = self.ee_frame
         request.waypoints = waypoints
