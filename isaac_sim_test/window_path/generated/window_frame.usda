@@ -1,0 +1,52 @@
+#usda 1.0
+(
+    defaultPrim = "window_frame"
+    metersPerUnit = 1
+    upAxis = "Z"
+    doc = "Parent once. Path is already ROS m. FBX child still needs cm + Rx90."
+)
+
+def Xform "window_frame"
+{
+    double3 xformOp:translate = (-0.753098, -0.200000, 1.147811)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def Xform "window_geo" (
+        prepend references = @../../3d/windows.fbx@
+    )
+    {
+        quatd xformOp:orient = (0.7071067811865476, 0.7071067811865476, 0.0, 0.0)
+        double3 xformOp:scale = (0.01, 0.01, 0.01)
+        uniform token[] xformOpOrder = ["xformOp:orient", "xformOp:scale"]
+    }
+
+    def BasisCurves "S_path"
+    {
+        uniform token type = "linear"
+        int[] curveVertexCounts = [5]
+        point3f[] points = [
+            (1.035361, -0.000000, -0.903127),
+            (1.970835, -0.000000, -0.903127),
+            (1.970835, -0.000000, 0.307506),
+            (1.035361, -0.000000, 0.307506),
+            (1.035361, -0.000000, -0.903127)
+        ]
+        float[] widths = [0.012]
+        color3f[] primvars:displayColor = [(0.15, 0.95, 0.35)]
+    }
+
+    def BasisCurves "L_path"
+    {
+        uniform token type = "linear"
+        int[] curveVertexCounts = [5]
+        point3f[] points = [
+            (0.477605, -0.000000, -1.380624),
+            (2.528486, -0.000000, -1.380624),
+            (2.528486, -0.000000, 0.370604),
+            (0.477605, -0.000000, 0.370604),
+            (0.477605, -0.000000, -1.380624)
+        ]
+        float[] widths = [0.012]
+        color3f[] primvars:displayColor = [(0.95, 0.75, 0.15)]
+    }
+}

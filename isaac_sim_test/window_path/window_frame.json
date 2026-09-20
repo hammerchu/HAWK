@@ -1,0 +1,15 @@
+{
+  "comment": "ONE parent pose for window mesh and S/L paths. Edit this file, then re-run export_aligned.py. CAD-local ROS m = Fusion cm/100 then (x,y,z)->(x,-z,y). Default puts the S pane in GCR reach (~2 m) in front of the base.",
+  "parent_frame": "world",
+  "translation_m": [-0.753098, -0.20, 1.147811],
+  "rpy_rad": [0.0, 0.0, 0.0],
+  "approach_offset_m": 0.02,
+  "spacing_m": 0.03,
+  "fbx_scale": 0.01,
+  "moveit": {
+    "group_name": "duco_arm",
+    "base_frame": "base_link",
+    "ee_frame": "gcr16_link6",
+    "controller_action": "/duco_arm_controller/follow_joint_trajectory"
+  }
+}

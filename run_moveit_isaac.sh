@@ -7,12 +7,12 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/humble/setup.bash}"
-MOVEIT_SETUP="${MOVEIT_SETUP:-$HOME/ws_moveit2/panda_arm_example/install/setup.bash}"
+MOVEIT_SETUP="${MOVEIT_SETUP:-$HOME/ws_moveit2/duco_arm_example/install/setup.bash}"
 ISAAC_DIR="${ISAAC_DIR:-$HOME/DEV/isaacsim/_build/linux-x86_64/release}"
 ISAAC_SH="${ISAAC_SH:-}"
 SCENE_USD="${SCENE_USD:-}"
 RUN_CURVE="${RUN_CURVE:-0}"
-FOLLOW_CURVE="${FOLLOW_CURVE:-$ROOT/isaac_sim_test/follow_curve_moveit.py}"
+FOLLOW_CURVE="${FOLLOW_CURVE:-$ROOT/isaac_sim_test/follow_s_path_moveit.py}"
 
 # Pick isaac-sim.sh if the caller did not set ISAAC_SH.
 find_isaac_launcher() {
@@ -102,7 +102,7 @@ echo 'Launching Isaac. Load the saved scene (if needed) and press Play.'
 source $(printf '%q' "${MOVEIT_SETUP}")
 ros2 daemon stop || true
 echo 'Starting MoveIt demo. Wait until /controller_manager is up.'
-ros2 launch panda_arm_example demo.launch.py
+ros2 launch duco_arm_example demo.launch.py
 "
 
     open_shell "HAWK Isaac" "${isaac_cmd}"
@@ -121,7 +121,8 @@ python3 $(printf '%q' "${FOLLOW_CURVE}")
 
     echo "Opened Isaac + MoveIt shells (ROS_DOMAIN_ID=${ROS_DOMAIN_ID})."
     echo "In Isaac: scene loaded, ROS 2 Bridge on, press Play."
-    echo "Optional curve later:"
+    echo "Optional S-path later (GCR joint6 tip):"
+    echo "  python3 ${FOLLOW_CURVE} --preview"
     echo "  python3 ${FOLLOW_CURVE}"
     echo "  python3 ${FOLLOW_CURVE} --stop"
     if command -v tmux >/dev/null 2>&1 && [ -z "${TMUX:-}" ] && ! command -v gnome-terminal >/dev/null 2>&1; then
